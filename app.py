@@ -62,9 +62,10 @@ def main():
 
     if qprof.empty:
         available_ids = []
+        col = None
     else:
         col = "PDB_ID" if "PDB_ID" in qprof else "pdb_id"
-    available_ids = sorted(set(qprof[col].astype(str).str.upper()))
+        available_ids = sorted(set(qprof[col].astype(str).str.upper()))
     default_id = available_ids[0] if available_ids else ""
 
     pdb_input = st.text_input("Enter PDB ID (e.g., 1CF3):", value=default_id).strip()
