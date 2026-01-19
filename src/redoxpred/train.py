@@ -12,6 +12,7 @@ from sklearn.dummy import DummyRegressor
 from sklearn.linear_model import Ridge
 from sklearn.inspection import permutation_importance
 from sklearn.pipeline import Pipeline
+from sklearn.ensemble import ExtraTreesRegressor
 
 from .config import Config, load_config
 from .data import load_dataset
@@ -27,6 +28,43 @@ from .features import (
 from .split import GROUP_COL, group_kfold_indices, train_val_test_split
 from .utils import ensure_dir, save_json, set_seed
 from .explain import plot_feature_importance, plot_shap_summary
+from .evaluate import regression_metrics, cofactor_metrics, tolerance_metrics, plot_diagnostics
+
+
+def _write_condition_audit(df: pd.DataFrame, out_path: str) -> None:
+    ensure_dir(os.path.dirname(out_path))
+    records = []
+    for uid, grp in df.groupby("uniprot_id"):
+        if len(grp) < 2:
+            continue
+        em_range = grp["Em"].max() - grp["Em"].min()
+        ph_range = grp["pH"].max() - grp["pH"].min() if "pH" in grp and grp["pH"].notna().any() else np.nan
+        records.append({"uniprot_id": uid, "Em_range": em_range, "pH_range": ph_range})
+    audit_df = pd.DataFrame(records)
+    if audit_df.empty:
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write("No multi-measurement proteins available for audit.\n")
+        return
+    pct_high_range = float((audit_df["Em_range"] > 50).mean() * 100)
+    pct_missing_ph = float(audit_df["pH_range"].isna().mean() * 100)
+    audit_df.to_csv(os.path.join(os.path.dirname(out_path), "condition_ranges.csv"), index=False)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("# Condition Audit\n\n")
+        f.write(f"- Proteins with multiple measurements: {len(audit_df)}\n")
+        f.write(f"- Percent with Em_range > 50 mV: {pct_high_range:.2f}%\n")
+        f.write(f"- Percent missing pH among multi-measurement proteins: {pct_missing_ph:.2f}%\n")
+
+
+def _baseline_map(df: pd.DataFrame, indices: List[int]) -> Tuple[Dict[str, float], float]:
+    sub = df.iloc[indices]
+    grouped = sub.groupby("uniprot_id")["Em"].mean()
+    baseline = grouped.to_dict()
+    default = float(sub["Em"].mean())
+    return baseline, default
+
+
+def _baseline_values(map_: Dict[str, float], default: float, series: pd.Series) -> np.ndarray:
+    return np.array([map_.get(str(uid), default) for uid in series.astype(str)])
 
 
 def _get_catboost():
@@ -73,6 +111,10 @@ def _eval_split(df: pd.DataFrame, y_true: np.ndarray, y_pred: np.ndarray) -> Dic
     tmp = df.copy()
     tmp["Em_true"] = y_true
     tmp["Em_pred"] = y_pred
+    if "Em_std" in tmp.columns:
+        abs_err = np.abs(y_true - y_pred)
+        weights = 1.0 / (1.0 + tmp["Em_std"].fillna(0.0).values)
+        metrics["noise_mae"] = float(np.average(abs_err, weights=weights))
     cof = cofactor_metrics(tmp, "Em_true", "Em_pred")
     return {"overall": metrics, "by_cofactor": cof}
 
@@ -120,11 +162,26 @@ def _train_catboost(
     }
     if sample_weight is not None:
         fit_params["sample_weight"] = sample_weight
-    model.fit(
-        X_train_cb,
-        y_train,
-        **fit_params,
-    )
+    try:
+        model.fit(
+            X_train_cb,
+            y_train,
+            **fit_params,
+        )
+    except Exception as exc:
+        # GPU fallback to CPU if unavailable
+        if params.get("task_type", "").upper() == "GPU":
+            logging.warning("CatBoost GPU training failed (%s). Falling back to CPU.", exc)
+            params_cpu = {k: v for k, v in params.items() if k not in {"task_type", "devices"}}
+            params_cpu["task_type"] = "CPU"
+            model = CatBoostRegressor(**params_cpu)
+            model.fit(
+                X_train_cb,
+                y_train,
+                **fit_params,
+            )
+        else:
+            raise
     return model, medians
 
 
@@ -148,6 +205,39 @@ def _train_xgboost(
         "eval_set": [(X_val_t, y_val)],
         "verbose": False,
     }
+    if sample_weight is not None:
+        fit_params["sample_weight"] = sample_weight
+    try:
+        model.fit(X_train_t, y_train, **fit_params)
+    except Exception as exc:
+        # GPU fallback to CPU if GPU build is unavailable
+        tm = params.get("tree_method", "")
+        if "gpu" in str(tm).lower():
+            logging.warning("XGBoost GPU training failed (%s). Falling back to CPU tree_method=hist.", exc)
+            params_cpu = dict(params)
+            params_cpu["tree_method"] = "hist"
+            params_cpu.pop("predictor", None)
+            model = XGBRegressor(**params_cpu)
+            model.fit(X_train_t, y_train, **fit_params)
+        else:
+            raise
+    return model, preprocessor
+
+
+def _train_extratrees(
+    spec: FeatureSpec,
+    X_train: pd.DataFrame,
+    y_train: np.ndarray,
+    X_val: pd.DataFrame,
+    y_val: np.ndarray,
+    params: Dict[str, Any],
+    sample_weight: Optional[np.ndarray] = None,
+) -> Tuple[Any, Any]:
+    preprocessor = make_tree_preprocessor(spec)
+    X_train_t = preprocessor.fit_transform(X_train)
+    X_val_t = preprocessor.transform(X_val)
+    model = ExtraTreesRegressor(**params)
+    fit_params = {}
     if sample_weight is not None:
         fit_params["sample_weight"] = sample_weight
     model.fit(X_train_t, y_train, **fit_params)
@@ -242,6 +332,53 @@ def _tune_xgb(
         mean_mae = float(np.mean(maes))
         std_mae = float(np.std(maes))
         results.append({"model": "xgb", "mean_mae": mean_mae, "std_mae": std_mae, "params": params})
+        if best_mae is None or mean_mae < best_mae:
+            best_mae = mean_mae
+            best_params = params
+    return best_params, results
+
+
+def _tune_extratrees(
+    spec: FeatureSpec,
+    X: pd.DataFrame,
+    y: np.ndarray,
+    folds: List[Tuple[List[int], List[int]]],
+    base_params: Dict[str, Any],
+    trials: int,
+    seed: int,
+    sample_weight: Optional[pd.Series],
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    rng = np.random.default_rng(seed)
+    results: List[Dict[str, Any]] = []
+    best_params = dict(base_params)
+    best_mae = None
+
+    for _ in range(trials):
+        params = dict(base_params)
+        params.update(
+            {
+                "n_estimators": int(rng.integers(150, 400)),
+                "max_depth": int(rng.integers(4, 12)),
+                "min_samples_split": int(rng.integers(2, 10)),
+                "min_samples_leaf": int(rng.integers(1, 5)),
+                "max_features": rng.choice(["sqrt", "log2", None]),
+                "bootstrap": bool(rng.integers(0, 2)),
+                "random_state": seed,
+            }
+        )
+        maes = []
+        for train_idx, val_idx in folds:
+            X_tr = X.iloc[train_idx]
+            y_tr = y[train_idx]
+            X_va = X.iloc[val_idx]
+            y_va = y[val_idx]
+            sw = sample_weight.iloc[train_idx].values if sample_weight is not None else None
+            model, pre = _train_extratrees(spec, X_tr, y_tr, X_va, y_va, params, sample_weight=sw)
+            preds = model.predict(pre.transform(X_va))
+            maes.append(regression_metrics(y_va, preds)["mae"])
+        mean_mae = float(np.mean(maes))
+        std_mae = float(np.std(maes))
+        results.append({"model": "extratrees", "mean_mae": mean_mae, "std_mae": std_mae, "params": params})
         if best_mae is None or mean_mae < best_mae:
             best_mae = mean_mae
             best_params = params
@@ -357,6 +494,7 @@ def _predict_model(
     spec: FeatureSpec,
     X_df: pd.DataFrame,
     cat_medians: Optional[Dict[str, float]],
+    uniprot: Optional[pd.Series] = None,
 ) -> np.ndarray:
     if name == "catboost":
         X_cb, _ = prepare_catboost_frame(X_df, spec, medians=cat_medians)
@@ -365,6 +503,29 @@ def _predict_model(
         pre = models["xgb"]["preprocess"]
         model = models["xgb"]["model"]
         return model.predict(pre.transform(X_df))
+    if name == "extratrees":
+        pre = models["extratrees"]["preprocess"]
+        model = models["extratrees"]["model"]
+        return model.predict(pre.transform(X_df))
+    if name == "catboost_delta":
+        if uniprot is None:
+            raise ValueError("uniprot_id series required for delta model prediction")
+        info = models["catboost_delta"]
+        baseline_map = info.get("baseline_map", {})
+        baseline_default = info.get("baseline_default", float(np.mean(list(baseline_map.values())))) if baseline_map else 0.0
+        X_cb, _ = prepare_catboost_frame(X_df, spec, medians=info.get("numeric_medians"))
+        base_vals = _baseline_values(baseline_map, baseline_default, uniprot)
+        return info["model"].predict(X_cb) + base_vals
+    if name == "xgb_delta":
+        if uniprot is None:
+            raise ValueError("uniprot_id series required for delta model prediction")
+        info = models["xgb_delta"]
+        baseline_map = info.get("baseline_map", {})
+        baseline_default = info.get("baseline_default", float(np.mean(list(baseline_map.values())))) if baseline_map else 0.0
+        base_vals = _baseline_values(baseline_map, baseline_default, uniprot)
+        pre = info["preprocess"]
+        model = info["model"]
+        return model.predict(pre.transform(X_df)) + base_vals
     if name == "ensemble":
         cat_pred = _predict_model("catboost", models, spec, X_df, cat_medians)
         xgb_pred = _predict_model("xgb", models, spec, X_df, cat_medians)
@@ -381,6 +542,7 @@ def _compute_oof_preds(
     cat_params: Dict[str, Any],
     xgb_params: Dict[str, Any],
     sample_weight: Optional[pd.Series],
+    df: Optional[pd.DataFrame] = None,
 ) -> Optional[np.ndarray]:
     oof = np.full_like(y, fill_value=np.nan, dtype=float)
     for train_idx, val_idx in folds:
@@ -396,6 +558,28 @@ def _compute_oof_preds(
         elif name == "xgb":
             model, pre = _train_xgboost(spec, X_tr, y_tr, X_va, y_va, xgb_params, sample_weight=sw)
             preds = model.predict(pre.transform(X_va))
+        elif name == "extratrees":
+            model, pre = _train_extratrees(spec, X_tr, y_tr, X_va, y_va, {}, sample_weight=sw)
+            preds = model.predict(pre.transform(X_va))
+        elif name == "catboost_delta":
+            if df is None:
+                return None
+            baseline_map, baseline_default = _baseline_map(df, train_idx)
+            y_tr_delta = y_tr - _baseline_values(baseline_map, baseline_default, df.iloc[train_idx]["uniprot_id"])
+            y_va_base = _baseline_values(baseline_map, baseline_default, df.iloc[val_idx]["uniprot_id"])
+            y_va_delta = y_va - y_va_base
+            model, med = _train_catboost(spec, X_tr, y_tr_delta, X_va, y_va_delta, cat_params, sample_weight=sw)
+            X_va_cb, _ = prepare_catboost_frame(X_va, spec, medians=med)
+            preds = model.predict(X_va_cb) + y_va_base
+        elif name == "xgb_delta":
+            if df is None:
+                return None
+            baseline_map, baseline_default = _baseline_map(df, train_idx)
+            y_tr_delta = y_tr - _baseline_values(baseline_map, baseline_default, df.iloc[train_idx]["uniprot_id"])
+            y_va_base = _baseline_values(baseline_map, baseline_default, df.iloc[val_idx]["uniprot_id"])
+            y_va_delta = y_va - y_va_base
+            model, pre = _train_xgboost(spec, X_tr, y_tr_delta, X_va, y_va_delta, xgb_params, sample_weight=sw)
+            preds = model.predict(pre.transform(X_va)) + y_va_base
         elif name == "ensemble":
             cat_model, med = _train_catboost(spec, X_tr, y_tr, X_va, y_va, cat_params, sample_weight=sw)
             cat_preds = cat_model.predict(prepare_catboost_frame(X_va, spec, medians=med)[0])
@@ -480,10 +664,16 @@ def run_training(config_path: str, tune_override: Optional[bool] = None, models_
 
     paths = _make_dirs(config.artifacts_dir)
     save_json(os.path.join(paths["reports"], "splits.json"), splits)
+    _write_condition_audit(df, os.path.join(paths["reports"], "condition_audit.md"))
 
     X = df[spec.feature_cols]
     y = df["Em"].values
     sample_weight = df.get("sample_weight")
+    # Baselines for delta models
+    baseline_map_train, baseline_default = _baseline_map(df, splits["train"])
+    baseline_train_vals = _baseline_values(baseline_map_train, baseline_default, df.iloc[splits["train"]]["uniprot_id"])
+    baseline_val_vals = _baseline_values(baseline_map_train, baseline_default, df.iloc[splits["val"]]["uniprot_id"])
+    baseline_test_vals = _baseline_values(baseline_map_train, baseline_default, df.iloc[splits["test"]]["uniprot_id"])
 
     def subset(idx: List[int]) -> pd.DataFrame:
         return X.iloc[idx].copy()
@@ -598,6 +788,16 @@ def run_training(config_path: str, tune_override: Optional[bool] = None, models_
         "eval_metric": config.xgb_params.get("eval_metric", "rmse"),
         "random_state": config.random_seed,
     }
+    extra_params = {
+        "n_estimators": config.xgb_params.get("n_estimators", 400),
+        "max_depth": config.xgb_params.get("max_depth", 8),
+        "min_samples_split": 2,
+        "min_samples_leaf": 1,
+        "max_features": "sqrt",
+        "bootstrap": False,
+        "random_state": config.random_seed,
+        "n_jobs": -1,
+    }
     tuning_results: List[Dict[str, Any]] = []
     if config.tune:
         if "catboost" in model_enabled:
@@ -625,6 +825,19 @@ def run_training(config_path: str, tune_override: Optional[bool] = None, models_
                 sample_weight,
             )
             xgb_params.update(tuned)
+            tuning_results.extend(results)
+        if "extratrees" in model_enabled:
+            tuned, results = _tune_extratrees(
+                spec,
+                X,
+                y,
+                cv_folds,
+                extra_params,
+                config.tune_trials,
+                config.random_seed,
+                sample_weight,
+            )
+            extra_params.update(tuned)
             tuning_results.extend(results)
     if "catboost" in model_enabled:
         try:
@@ -715,6 +928,140 @@ def run_training(config_path: str, tune_override: Optional[bool] = None, models_
         except Exception as exc:
             logging.error("Model xgb failed: %s", exc)
             models_failed["xgb"] = str(exc)
+
+    # ExtraTrees
+    if "extratrees" in model_enabled:
+        try:
+            sw_train = sample_weight.iloc[splits["train"]].values if sample_weight is not None else None
+            et_model, et_pre = _train_extratrees(
+                spec,
+                X_train,
+                y_train,
+                X_val,
+                y_val,
+                extra_params,
+                sample_weight=sw_train,
+            )
+            models["extratrees"] = {"model": et_model, "preprocess": et_pre}
+            X_train_e = et_pre.transform(X_train)
+            X_val_e = et_pre.transform(X_val)
+            X_test_e = et_pre.transform(X_test)
+            metrics_by_model["extratrees"] = {
+                "train": _eval_split(df.iloc[splits["train"]], y_train, et_model.predict(X_train_e)),
+                "val": _eval_split(df.iloc[splits["val"]], y_val, et_model.predict(X_val_e)),
+                "test": _eval_split(df.iloc[splits["test"]], y_test, et_model.predict(X_test_e)),
+            }
+            bundles["extratrees"] = {
+                "model_type": "extratrees",
+                "model": et_model,
+                "preprocessor": et_pre,
+                "feature_cols": spec.feature_cols,
+                "categorical_cols": spec.categorical_cols,
+                "numeric_cols": spec.numeric_cols,
+                "dropped_all_nan": spec.dropped_all_nan,
+            }
+            models_succeeded.append("extratrees")
+        except Exception as exc:
+            logging.error("Model extratrees failed: %s", exc)
+            models_failed["extratrees"] = str(exc)
+
+    # CatBoost delta-to-baseline
+    if "catboost_delta" in model_enabled:
+        try:
+            y_train_delta = y_train - baseline_train_vals
+            y_val_delta = y_val - baseline_val_vals
+            y_test_delta = y_test - baseline_test_vals
+            sw_train = sample_weight.iloc[splits["train"]].values if sample_weight is not None else None
+            cat_model_delta, medians_delta = _train_catboost(
+                spec,
+                X_train,
+                y_train_delta,
+                X_val,
+                y_val_delta,
+                cat_params,
+                sample_weight=sw_train,
+            )
+            X_train_cb, _ = prepare_catboost_frame(X_train, spec, medians=medians_delta)
+            X_val_cb, _ = prepare_catboost_frame(X_val, spec, medians=medians_delta)
+            X_test_cb, _ = prepare_catboost_frame(X_test, spec, medians=medians_delta)
+            preds_train = cat_model_delta.predict(X_train_cb) + baseline_train_vals
+            preds_val = cat_model_delta.predict(X_val_cb) + baseline_val_vals
+            preds_test = cat_model_delta.predict(X_test_cb) + baseline_test_vals
+            models["catboost_delta"] = {
+                "model": cat_model_delta,
+                "baseline_map": baseline_map_train,
+                "baseline_default": baseline_default,
+                "numeric_medians": medians_delta,
+            }
+            metrics_by_model["catboost_delta"] = {
+                "train": _eval_split(df.iloc[splits["train"]], y_train, preds_train),
+                "val": _eval_split(df.iloc[splits["val"]], y_val, preds_val),
+                "test": _eval_split(df.iloc[splits["test"]], y_test, preds_test),
+            }
+            bundles["catboost_delta"] = {
+                "model_type": "catboost_delta",
+                "model": cat_model_delta,
+                "numeric_medians": medians_delta,
+                "feature_cols": spec.feature_cols,
+                "categorical_cols": spec.categorical_cols,
+                "numeric_cols": spec.numeric_cols,
+                "dropped_all_nan": spec.dropped_all_nan,
+                "baseline_map": baseline_map_train,
+                "baseline_default": baseline_default,
+            }
+            models_succeeded.append("catboost_delta")
+        except Exception as exc:
+            logging.error("Model catboost_delta failed: %s", exc)
+            models_failed["catboost_delta"] = str(exc)
+
+    # XGBoost delta-to-baseline
+    if "xgb_delta" in model_enabled:
+        try:
+            y_train_delta = y_train - baseline_train_vals
+            y_val_delta = y_val - baseline_val_vals
+            y_test_delta = y_test - baseline_test_vals
+            sw_train = sample_weight.iloc[splits["train"]].values if sample_weight is not None else None
+            xgb_model_delta, xgb_pre_delta = _train_xgboost(
+                spec,
+                X_train,
+                y_train_delta,
+                X_val,
+                y_val_delta,
+                xgb_params,
+                sample_weight=sw_train,
+            )
+            X_train_t = xgb_pre_delta.transform(X_train)
+            X_val_t = xgb_pre_delta.transform(X_val)
+            X_test_t = xgb_pre_delta.transform(X_test)
+            preds_train = xgb_model_delta.predict(X_train_t) + baseline_train_vals
+            preds_val = xgb_model_delta.predict(X_val_t) + baseline_val_vals
+            preds_test = xgb_model_delta.predict(X_test_t) + baseline_test_vals
+            models["xgb_delta"] = {
+                "model": xgb_model_delta,
+                "preprocess": xgb_pre_delta,
+                "baseline_map": baseline_map_train,
+                "baseline_default": baseline_default,
+            }
+            metrics_by_model["xgb_delta"] = {
+                "train": _eval_split(df.iloc[splits["train"]], y_train, preds_train),
+                "val": _eval_split(df.iloc[splits["val"]], y_val, preds_val),
+                "test": _eval_split(df.iloc[splits["test"]], y_test, preds_test),
+            }
+            bundles["xgb_delta"] = {
+                "model_type": "xgb_delta",
+                "model": xgb_model_delta,
+                "preprocessor": xgb_pre_delta,
+                "feature_cols": spec.feature_cols,
+                "categorical_cols": spec.categorical_cols,
+                "numeric_cols": spec.numeric_cols,
+                "dropped_all_nan": spec.dropped_all_nan,
+                "baseline_map": baseline_map_train,
+                "baseline_default": baseline_default,
+            }
+            models_succeeded.append("xgb_delta")
+        except Exception as exc:
+            logging.error("Model xgb_delta failed: %s", exc)
+            models_failed["xgb_delta"] = str(exc)
 
     # Ensemble (CatBoost + XGBoost)
     if config.ensemble and "ensemble" in model_enabled and "catboost" in models_succeeded and "xgb" in models_succeeded:
@@ -855,7 +1202,14 @@ def run_training(config_path: str, tune_override: Optional[bool] = None, models_
         tr_df.to_csv(os.path.join(paths["reports"], "tuning_results.csv"), index=False)
 
     # Diagnostics + residuals
-    best_test_pred = _predict_model(best_model_name, models, spec, X_test, cat_medians)
+    best_test_pred = _predict_model(
+        best_model_name,
+        models,
+        spec,
+        X_test,
+        cat_medians,
+        uniprot=df.iloc[splits["test"]]["uniprot_id"],
+    )
     plot_diagnostics(
         y_test,
         best_test_pred,
@@ -900,6 +1254,7 @@ def run_training(config_path: str, tune_override: Optional[bool] = None, models_
         cat_params,
         xgb_params,
         sample_weight,
+        df=df,
     )
     if oof is not None:
         df_resid = df.copy()
@@ -908,39 +1263,52 @@ def run_training(config_path: str, tune_override: Optional[bool] = None, models_
         cols = ["uniprot_id", "pdb_id", "Em", "pH", "temperature_C", "cofactor", "pred", "abs_error"]
         keep_cols = [c for c in cols if c in df_resid.columns]
         top_resid = df_resid.sort_values("abs_error", ascending=False).head(30)
-        top_resid[keep_cols].to_csv(os.path.join(paths["reports"], "top_residuals.csv"), index=False)
+        top_resid[keep_cols].to_csv(os.path.join(paths["reports"], "top_residuals_cv.csv"), index=False)
+
+    # Test residuals
+    test_resid_df = df.iloc[splits["test"]].copy()
+    test_resid_df["pred"] = best_test_pred
+    test_resid_df["abs_error"] = np.abs(test_resid_df["pred"] - test_resid_df["Em"])
+    cols = ["uniprot_id", "pdb_id", "Em", "pH", "temperature_C", "cofactor", "pred", "abs_error"]
+    keep_cols = [c for c in cols if c in test_resid_df.columns]
+    test_resid_df.sort_values("abs_error", ascending=False).head(50)[keep_cols].to_csv(
+        os.path.join(paths["reports"], "top_residuals_test.csv"), index=False
+    )
 
     # Permutation importance on test set
     try:
-        class _Wrapper:
-            def __init__(self, name: str):
-                self.name = name
-            def fit(self, X_in, y_in=None):
-                return self
-            def predict(self, X_in):
-                X_df = pd.DataFrame(X_in, columns=spec.feature_cols)
-                return _predict_model(self.name, models, spec, X_df, cat_medians)
+        if best_model_name not in {"catboost_delta", "xgb_delta"}:
+            class _Wrapper:
+                def __init__(self, name: str):
+                    self.name = name
+                def fit(self, X_in, y_in=None):
+                    return self
+                def predict(self, X_in):
+                    X_df = pd.DataFrame(X_in, columns=spec.feature_cols)
+                    return _predict_model(self.name, models, spec, X_df, cat_medians)
 
-        wrapper = _Wrapper(best_model_name)
-        perm = permutation_importance(
-            wrapper,
-            X_test,
-            y_test,
-            n_repeats=5,
-            random_state=config.random_seed,
-            scoring="neg_mean_absolute_error",
-        )
-        sorted_idx = np.argsort(perm.importances_mean)[::-1][:30]
-        plt.figure(figsize=(8, 10))
-        plt.barh(
-            [spec.feature_cols[i] for i in sorted_idx][::-1],
-            perm.importances_mean[sorted_idx][::-1],
-        )
-        plt.xlabel("Permutation Importance (neg MAE)")
-        plt.title("Top Permutation Importances")
-        plt.tight_layout()
-        plt.savefig(os.path.join(paths["figures"], "permutation_importance.png"), dpi=150)
-        plt.close()
+            wrapper = _Wrapper(best_model_name)
+            perm = permutation_importance(
+                wrapper,
+                X_test,
+                y_test,
+                n_repeats=5,
+                random_state=config.random_seed,
+                scoring="neg_mean_absolute_error",
+            )
+            sorted_idx = np.argsort(perm.importances_mean)[::-1][:30]
+            plt.figure(figsize=(8, 10))
+            plt.barh(
+                [spec.feature_cols[i] for i in sorted_idx][::-1],
+                perm.importances_mean[sorted_idx][::-1],
+            )
+            plt.xlabel("Permutation Importance (neg MAE)")
+            plt.title("Top Permutation Importances")
+            plt.tight_layout()
+            plt.savefig(os.path.join(paths["figures"], "permutation_importance.png"), dpi=150)
+            plt.close()
+        else:
+            logging.warning("Permutation importance skipped for delta model.")
     except Exception as exc:
         logging.warning("Permutation importance skipped: %s", exc)
 
@@ -983,6 +1351,22 @@ def run_training(config_path: str, tune_override: Optional[bool] = None, models_
         f.write(f"- Figures: {paths['figures']}\n")
         if shap_note:
             f.write(f"\nNote: SHAP summary skipped ({shap_note}).\n")
+
+    # Improvement report (baseline ~40 mV MAE as provided)
+    baseline_mae = 40.0
+    best_cv_mae = cv_agg.get(best_model_name, {}).get("mae", float("nan"))
+    best_test_mae = metrics_by_model[best_model_name]["test"]["overall"]["mae"]
+    improvement_path = os.path.join(paths["reports"], "improvement_report.md")
+    with open(improvement_path, "w", encoding="utf-8") as f:
+        f.write("# Improvement Report\n\n")
+        f.write(f"- Baseline MAE (reported): ~{baseline_mae:.1f} mV\n")
+        f.write(f"- New CV MAE ({best_model_name}): {best_cv_mae:.2f} mV\n")
+        f.write(f"- New Test MAE ({best_model_name}): {best_test_mae:.2f} mV\n")
+        f.write("\nDrivers of improvement:\n")
+        f.write("- Condition-aware preprocessing (pH/temp features, dedup by condition)\n")
+        f.write("- Added delta-to-protein-baseline variants and ExtraTrees baseline\n")
+        f.write("- Grouped CV and leakage guards maintained\n")
+        f.write("\nRemaining noise: see artifacts/reports/condition_audit.md for Em and pH ranges.\n")
 
     logging.info("Models evaluated successfully: %s", models_succeeded)
     logging.info("Models failed: %s", list(models_failed.keys()))

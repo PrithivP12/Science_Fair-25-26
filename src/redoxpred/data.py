@@ -9,15 +9,17 @@ TARGET_COL = "Em"
 
 
 def load_dataset(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        fallback_csv = os.path.splitext(path)[0] + ".csv"
+        if os.path.exists(fallback_csv):
+            path = fallback_csv
+        else:
+            raise FileNotFoundError(f"Dataset not found: {path}")
+
     if path.lower().endswith(".parquet"):
         try:
             return pd.read_parquet(path)
         except Exception:
-            if not os.path.exists(path):
-                fallback_csv = os.path.splitext(path)[0] + ".csv"
-                if os.path.exists(fallback_csv):
-                    return pd.read_csv(fallback_csv, low_memory=False)
-            # fallback to CSV if parquet engine unavailable or file is CSV with parquet name
             return pd.read_csv(path, low_memory=False)
     return pd.read_csv(path, low_memory=False)
 

@@ -6,11 +6,11 @@ selection_metric: MAE
 selection_split: cv
 tuning: true
 tune_trials: 20
-models: [dummy, ridge, catboost, xgb, ensemble]
+models: [dummy, ridge, catboost, xgb, extratrees, catboost_delta, xgb_delta, ensemble]
 ensemble: true
 
 data:
-  path: data/redox_dataset_preprocessed.parquet
+  path: data/redox_dataset_preprocessed.csv
 
 artifacts:
   dir: artifacts

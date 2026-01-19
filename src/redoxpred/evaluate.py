@@ -13,7 +13,8 @@ def regression_metrics(y_true, y_pred) -> Dict[str, float]:
     mae = float(mean_absolute_error(y_true, y_pred))
     rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
     r2 = float(r2_score(y_true, y_pred))
-    return {"mae": mae, "rmse": rmse, "r2": r2}
+    med_ae = float(np.median(np.abs(y_true - y_pred)))
+    return {"mae": mae, "rmse": rmse, "r2": r2, "median_ae": med_ae}
 
 
 def tolerance_metrics(y_true, y_pred) -> Dict[str, float]:
