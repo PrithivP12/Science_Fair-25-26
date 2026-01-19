@@ -21,6 +21,11 @@ CRITICAL_ST_GAP = 0.01
 def load_data(_reload_token: int = 0):
     bulk = pd.read_csv(BULK_RESULTS) if BULK_RESULTS.exists() else pd.DataFrame()
     qprof = pd.read_csv(QUANTUM_PROFILES) if QUANTUM_PROFILES.exists() else pd.DataFrame()
+    if not qprof.empty and "pdb_id" in qprof:
+        qprof["PDB_ID"] = qprof["pdb_id"].astype(str).str.upper()
+        qprof = qprof.drop_duplicates(subset=["PDB_ID"], keep="last")
+    if not bulk.empty and "pdb_id" in bulk:
+        bulk["PDB_ID"] = bulk["pdb_id"].astype(str).str.upper()
     scorecard = {}
     if SCORECARD.exists():
         with open(SCORECARD, "r", encoding="utf-8") as f:
@@ -30,9 +35,9 @@ def load_data(_reload_token: int = 0):
 def get_entry(pdb_id, bulk, qprof):
     if bulk.empty or qprof.empty:
         return None, None
-    mask = bulk["pdb_id"].astype(str).str.upper() == pdb_id.upper()
-    bulk_row = bulk[mask].head(1)
-    q_row = qprof[mask].head(1)
+    pid = pdb_id.upper()
+    bulk_row = bulk[bulk["PDB_ID"] == pid].head(1) if "PDB_ID" in bulk else pd.DataFrame()
+    q_row = qprof[qprof["PDB_ID"] == pid].head(1) if "PDB_ID" in qprof else pd.DataFrame()
     if bulk_row.empty or q_row.empty:
         return None, None
     return bulk_row.iloc[0], q_row.iloc[0]
@@ -91,6 +96,7 @@ def main():
             err_msg = proc.stderr.strip() or proc.stdout.strip() or "Unknown error"
             st.error(f"VQE simulation failed: {err_msg}")
             return
+        st.cache_data.clear()
         st.session_state["reload_token"] = st.session_state.get("reload_token", 0) + 1
         bulk, qprof, scorecard = load_data(st.session_state["reload_token"])
         available_ids = sorted(set(qprof["pdb_id"].astype(str).str.upper())) if not qprof.empty else []
@@ -99,7 +105,7 @@ def main():
         st.markdown(f"### Selected PDB: `{pdb_id}`")
         bulk_row, q_row = get_entry(pdb_id, bulk, qprof)
         if bulk_row is None or q_row is None:
-            st.warning("PDB not found in current Phase 6 artifacts. Run scripts/vqe_n5_edge.py first.")
+            st.warning("Calculation pending for this molecule. Please wait for the VQE engine to finish.")
         else:
             st.subheader("Quantum Profile")
             st.json({
@@ -121,7 +127,7 @@ def main():
                 delta="CRITICAL" if st_gap < CRITICAL_ST_GAP else "OK",
             )
             if pd.notna(st_gap) and pd.notna(n5_spin) and (st_gap < CRITICAL_ST_GAP) and (n5_spin > 0.4):
-                st.error("🎯 CRITICAL DISCOVERY: HIGH-PRECISION QUANTUM NEEDLE DETECTED.\n\nThis protein's electronic signature matches the Hore et al. (PNAS 2016) criteria for microsecond spin coherence and 5-degree heading precision.")
+                st.success("🎯 CRITICAL DISCOVERY: HIGH-PRECISION QUANTUM NEEDLE DETECTED.\n\nThis protein's electronic signature matches the Hore et al. (PNAS 2016) criteria for microsecond spin coherence and 5-degree heading precision.")
             elif candidate:
                 st.warning("Magnetoreception Candidate (PNAS 1600341113 criteria)")
             else:
