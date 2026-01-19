@@ -169,7 +169,7 @@ def main():
     if scorecard:
         st.sidebar.json(scorecard)
         if scorecard.get("global_mae_n139", 0) == 0:
-            st.sidebar.warning("Database Reset Detected. Please rerun the full dataset.")
+            st.sidebar.error("DATABASE CORRUPTED. RUN FULL DATASET RECOVERY.")
     else:
         st.sidebar.info("Run scripts/vqe_n5_edge.py to generate artifacts.")
     if st.sidebar.button("Refresh Data", key="refresh_data"):
