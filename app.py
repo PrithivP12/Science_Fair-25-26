@@ -77,24 +77,8 @@ def main():
 
     # Auto-analysis for uploaded PDB not in artifacts
     if pdb_file is not None and pdb_id and (qprof.empty or pdb_id.upper() not in set(qprof["pdb_id"].astype(str).str.upper())):
-        import tempfile
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdb") as tmp:
-            tmp.write(pdb_file.getvalue())
-            tmp_path = tmp.name
-        with st.spinner("Quantum simulation in progress... calculating Spin Density and ST-Gaps."):
-            proc = subprocess.run(
-                [sys.executable, "scripts/vqe_n5_edge.py", "--pdb", tmp_path],
-                capture_output=True,
-                text=True,
-            )
-        if proc.returncode != 0:
-            err_msg = proc.stderr.strip() or proc.stdout.strip() or "Unknown error"
-            st.error(f"VQE simulation failed: {err_msg}")
-            return
-        # reload data
-        st.session_state["reload_token"] = st.session_state.get("reload_token", 0) + 1
-        bulk, qprof, scorecard = load_data(st.session_state["reload_token"])
-        available_ids = sorted(set(qprof["pdb_id"].astype(str).str.upper())) if not qprof.empty else []
+        st.error("Auto-VQE for uploaded PDBs is not supported (script has no --pdb flag). Please add this protein to the dataset and rerun scripts/vqe_n5_edge.py manually.")
+        return
 
     if pdb_id:
         st.markdown(f"### Selected PDB: `{pdb_id}`")
