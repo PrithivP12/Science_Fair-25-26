@@ -800,6 +800,12 @@ def main(args: argparse.Namespace) -> None:
         else:
             corr_spin = val
 
+    # Correlation between GPR residual and ST gap
+    res_with_gap = res_df.dropna(subset=["st_gap"])
+    corr_resid_gap = float("nan")
+    if not res_with_gap.empty and res_with_gap["st_gap"].std(ddof=0) > 0:
+        corr_resid_gap = np.corrcoef(res_with_gap["true_Em"] - res_with_gap["gpr_pred"], res_with_gap["st_gap"])[0, 1]
+
     # Clean-room plots
     plt.figure(figsize=(6, 6))
     plt.scatter(clean_df["true_Em"], clean_df["pred_final"], c="steelblue", alpha=0.7, label="Clean predictions")
@@ -850,6 +856,28 @@ def main(args: argparse.Namespace) -> None:
     plt.title("Spin vs Error Analysis (Failures highlighted)")
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, "Spin_vs_Error_Analysis.png"), dpi=150)
+    plt.close()
+
+    # Quantum property validation plot
+    fig, axs = plt.subplots(2, 2, figsize=(10, 8))
+    axs[0, 0].scatter(res_df["n5_spin_density"], res_df["true_Em"], alpha=0.6)
+    axs[0, 0].set_xlabel("N5 Spin Density")
+    axs[0, 0].set_ylabel("Experimental Em (mV)")
+    axs[0, 0].set_title("N5 Spin vs Em")
+
+    axs[0, 1].scatter(res_df["st_gap"], res_df["Around_N5_Flexibility"], alpha=0.6)
+    axs[0, 1].set_xlabel("ST Gap (mV)")
+    axs[0, 1].set_ylabel("Flexibility")
+    axs[0, 1].set_title("ST Gap vs Flexibility")
+
+    axs[1, 0].scatter(res_df["homo_lumo_gap"], res_df["Around_N5_HBondCap"], alpha=0.6)
+    axs[1, 0].set_xlabel("HOMO-LUMO Gap (mV)")
+    axs[1, 0].set_ylabel("HBondCap")
+    axs[1, 0].set_title("Gap vs HBondCap")
+
+    axs[1, 1].axis("off")
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "Quantum_Property_Validation.png"), dpi=150)
     plt.close()
 
     # If MAE > 46 mV, revert failure 10 to pure GPR and recompute metrics
@@ -933,15 +961,12 @@ def main(args: argparse.Namespace) -> None:
     res_df = res_df.merge(qprof[["pdb_id", "Magnetoreception_Candidate"]], on="pdb_id", how="left")
     res_df["Magnetoreception_Candidate"] = res_df["Magnetoreception_Candidate"].fillna(False)
 
-    # Residual vs ST_Gap correlation
-    res_with_gap = res_df.dropna(subset=["st_gap"])
-    corr_resid_gap = float("nan")
-    if not res_with_gap.empty and res_with_gap["st_gap"].std(ddof=0) > 0:
-        corr_resid_gap = np.corrcoef(res_with_gap["true_Em"] - res_with_gap["gpr_pred"], res_with_gap["st_gap"])[0, 1]
-
     failure_candidates = res_df[res_df["pdb_id"].astype(str).str.upper().isin(failure_ids) & res_df["Magnetoreception_Candidate"]]
     avg_st_gap_hits = float(res_df[res_df["abs_err_final"] < CHEM_ACCURACY]["st_gap"].mean())
     avg_st_gap_miss = float(res_df[res_df["abs_err_final"] >= CHEM_ACCURACY]["st_gap"].mean())
+    failure_polar = res_df[res_df["pdb_id"].astype(str).str.upper().isin(failure_ids)][["pdb_id", "quantum_polarizability"]]
+    success_polar_mean = float(clean_df["quantum_polarizability"].mean())
+    failure_polar.to_csv(os.path.join(out_dir, "failure_polarizability_vs_success.csv"), index=False)
 
     final_scorecard = {
         "global_mae_n139": mae_final,
@@ -954,6 +979,10 @@ def main(args: argparse.Namespace) -> None:
         "avg_st_gap_hits": avg_st_gap_hits,
         "avg_st_gap_miss": avg_st_gap_miss,
         "corr_residual_vs_st_gap": corr_resid_gap,
+        "failure_polarizability_vs_success_mean": {
+            "success_mean": success_polar_mean,
+            "failure_list": failure_polar.to_dict(orient="records"),
+        },
         "conclusion": "Failure 10 show magnetic-like signatures" if len(failure_candidates) > 0 else "Failure 10 do not show strong magnetic signatures",
     }
     with open(os.path.join(out_dir, "Final_Project_Scorecard.json"), "w", encoding="utf-8") as f:

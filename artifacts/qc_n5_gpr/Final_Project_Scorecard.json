@@ -8,6 +8,95 @@
   "magnetic_candidates_failure10": 0,
   "avg_st_gap_hits": 0.016367526458143922,
   "avg_st_gap_miss": 0.013168191392646711,
-  "corr_residual_vs_st_gap": 0.03412688107689402,
+  "corr_residual_vs_st_gap": 0.14117615922616364,
+  "failure_polarizability_vs_success_mean": {
+    "success_mean": 0.28831330448236137,
+    "failure_list": [
+      {
+        "pdb_id": "1CF3",
+        "quantum_polarizability": 0.335195530726257
+      },
+      {
+        "pdb_id": "1E0Y",
+        "quantum_polarizability": 0.1675977653631285
+      },
+      {
+        "pdb_id": "1HUV",
+        "quantum_polarizability": 0.17142857142857143
+      },
+      {
+        "pdb_id": "1HUV",
+        "quantum_polarizability": 0.17142857142857143
+      },
+      {
+        "pdb_id": "1HUV",
+        "quantum_polarizability": 0.17142857142857143
+      },
+      {
+        "pdb_id": "1HUV",
+        "quantum_polarizability": 0.17142857142857143
+      },
+      {
+        "pdb_id": "1IJH",
+        "quantum_polarizability": 0.30927835051546393
+      },
+      {
+        "pdb_id": "1NG4",
+        "quantum_polarizability": 0.0
+      },
+      {
+        "pdb_id": "1UMK",
+        "quantum_polarizability": 0.16574585635359115
+      },
+      {
+        "pdb_id": "1VAO",
+        "quantum_polarizability": 0.335195530726257
+      },
+      {
+        "pdb_id": "2GMJ",
+        "quantum_polarizability": 0.16574585635359115
+      },
+      {
+        "pdb_id": "4MJW",
+        "quantum_polarizability": 0.8875739644970415
+      },
+      {
+        "pdb_id": "5K9B",
+        "quantum_polarizability": 0.17142857142857143
+      },
+      {
+        "pdb_id": "5K9B",
+        "quantum_polarizability": 0.17142857142857143
+      },
+      {
+        "pdb_id": "5K9B",
+        "quantum_polarizability": 0.17142857142857143
+      },
+      {
+        "pdb_id": "5K9B",
+        "quantum_polarizability": 0.17142857142857143
+      },
+      {
+        "pdb_id": "5K9B",
+        "quantum_polarizability": 0.17142857142857143
+      },
+      {
+        "pdb_id": "5K9B",
+        "quantum_polarizability": 0.17142857142857143
+      },
+      {
+        "pdb_id": "5K9B",
+        "quantum_polarizability": 0.17142857142857143
+      },
+      {
+        "pdb_id": "5K9B",
+        "quantum_polarizability": 0.17142857142857143
+      },
+      {
+        "pdb_id": "5K9B",
+        "quantum_polarizability": 0.17142857142857143
+      }
+    ]
+  },
   "conclusion": "Failure 10 do not show strong magnetic signatures"
 }
