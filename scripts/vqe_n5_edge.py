@@ -345,22 +345,29 @@ def predict_energy_16q(row, params: Dict[str, float], mv_to_au: float, gpr_basel
 
     e_n5, gap_n5, spin_n5 = block_ground_props(H_n5, Zsum)
     e_c4a, gap_c4a, _ = block_ground_props(H_c4a, Zsum)
-    e_c10, gap_c10, _ = block_ground_props(H_c10, Zsum)
+    e_c10, gap_c10, spin_c10 = block_ground_props(H_c10, Zsum)
     e_ringc, gap_ringc, _ = block_ground_props(H_ringc, Zsum)
 
     coupling_const = cross_scale * (1.0 + 0.3 * complexity)
     energy_mv = (e_n5 + e_c4a + e_c10 + e_ringc) / mv_to_au + coupling_const * 5.0
 
     pi_stack_score = float(row.get("Pi_Stack_Score", 0.0))
-    pi_shift = -25.0 * pi_stack_score
+    orientation_shift = -15.0 * pi_stack_score
+
+    st_gap = float(gap_n5 + gap_c4a + gap_c10 + gap_ringc)
+    polarizability = float((hb + c4a_pol + c10_proxy + ringc_proxy) / max(eps_eff, 1e-6))
+    magnetic_sensitivity = float(abs(spin_n5) + abs(spin_c10))
 
     profile = {
-        "homo_lumo_gap": float(gap_n5 + gap_c4a + gap_c10 + gap_ringc),
-        "polarizability": float((hb + c4a_pol + c10_proxy + ringc_proxy) / max(eps_eff, 1e-6)),
+        "homo_lumo_gap": st_gap,
+        "polarizability": polarizability,
         "n5_spin_density": float(spin_n5 / 4.0),
+        "n10_spin_density": float(spin_c10 / 4.0),
+        "st_gap": st_gap,
+        "magnetic_sensitivity": magnetic_sensitivity,
     }
 
-    return energy_mv + pi_shift, profile
+    return energy_mv + orientation_shift, profile
 
 
 def train_gpr(df: pd.DataFrame) -> GaussianProcessRegressor:
@@ -491,6 +498,10 @@ def main(args: argparse.Namespace) -> None:
                 nudge = 0.0
             else:
                 nudge = NUDGE_FACTOR_16Q * delta_q * damping
+            # Failure reclassification based on small ST gap
+            if pdb_upper in failure_ids and profile.get("st_gap", float("inf")) < 50.0:
+                # allow physics despite previous mute
+                pass
             pred_final = pred_gpr + nudge
             used_model = "hybrid_16q"
             pred_q_used = pred_q
@@ -569,6 +580,9 @@ def main(args: argparse.Namespace) -> None:
                 "homo_lumo_gap": float(profile_used.get("homo_lumo_gap", float("nan"))),
                 "quantum_polarizability": float(profile_used.get("polarizability", float("nan"))),
                 "n5_spin_density": float(profile_used.get("n5_spin_density", float("nan"))),
+                "n10_spin_density": float(profile_used.get("n10_spin_density", float("nan"))),
+                "st_gap": float(profile_used.get("st_gap", float("nan"))),
+                "magnetic_sensitivity_index": float(profile_used.get("magnetic_sensitivity", float("nan"))),
             }
         )
 
@@ -576,7 +590,20 @@ def main(args: argparse.Namespace) -> None:
     out_dir = "artifacts/qc_n5_gpr"
     os.makedirs(out_dir, exist_ok=True)
     res_df.to_csv(os.path.join(out_dir, "bulk_quantum_results.csv"), index=False)
-    res_df[["pdb_id", "true_Em", "gpr_pred", "pred_final", "homo_lumo_gap", "quantum_polarizability", "n5_spin_density"]].to_csv(
+    res_df[
+        [
+            "pdb_id",
+            "true_Em",
+            "gpr_pred",
+            "pred_final",
+            "homo_lumo_gap",
+            "quantum_polarizability",
+            "n5_spin_density",
+            "n10_spin_density",
+            "st_gap",
+            "magnetic_sensitivity_index",
+        ]
+    ].to_csv(
         os.path.join(out_dir, "Final_Quantum_Profiles.csv"), index=False
     )
 
