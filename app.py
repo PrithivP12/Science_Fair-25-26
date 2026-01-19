@@ -9,6 +9,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 import py3Dmol
+import time
 
 ARTIFACT_DIR = Path("artifacts/qc_n5_gpr")
 BULK_RESULTS = ARTIFACT_DIR / "bulk_quantum_results.csv"
@@ -59,7 +60,11 @@ def main():
     reload_token = st.session_state.get("reload_token", 0)
     bulk, qprof, scorecard = load_data(reload_token)
 
-    available_ids = sorted(set(qprof["pdb_id"].astype(str).str.upper())) if not qprof.empty else []
+    if qprof.empty:
+        available_ids = []
+    else:
+        col = "PDB_ID" if "PDB_ID" in qprof else "pdb_id"
+        available_ids = sorted(set(qprof[col].astype(str).str.upper()))
     default_id = available_ids[0] if available_ids else ""
 
     pdb_input = st.text_input("Enter PDB ID (e.g., 1CF3):", value=default_id).strip()
@@ -98,8 +103,13 @@ def main():
             return
         st.cache_data.clear()
         st.session_state["reload_token"] = st.session_state.get("reload_token", 0) + 1
-        bulk, qprof, scorecard = load_data(st.session_state["reload_token"])
-        available_ids = sorted(set(qprof["pdb_id"].astype(str).str.upper())) if not qprof.empty else []
+        # retry load a couple of times to catch fresh writes
+        for _ in range(3):
+            bulk, qprof, scorecard = load_data(st.session_state["reload_token"])
+            available_ids = sorted(set(qprof["PDB_ID"].astype(str).str.upper())) if not qprof.empty else []
+            if pdb_id.upper() in set(available_ids):
+                break
+            time.sleep(2)
 
     if pdb_id:
         st.markdown(f"### Selected PDB: `{pdb_id}`")
@@ -154,9 +164,11 @@ def main():
     st.sidebar.header("Project Scorecard")
     if scorecard:
         st.sidebar.json(scorecard)
+        if scorecard.get("global_mae_n139", 0) == 0:
+            st.sidebar.warning("Database Reset Detected. Please rerun the full dataset.")
     else:
         st.sidebar.info("Run scripts/vqe_n5_edge.py to generate artifacts.")
-    if st.sidebar.button("Refresh Data"):
+    if st.sidebar.button("Refresh Data", key="refresh_data"):
         st.cache_data.clear()
         bulk, qprof, scorecard = load_data(st.session_state.get("reload_token", 0))
     debug_path = QUANTUM_PROFILES

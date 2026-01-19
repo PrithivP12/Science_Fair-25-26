@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 from typing import Dict, Tuple
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -636,15 +637,16 @@ def main(args: argparse.Namespace) -> None:
         ]
     ]
     profile_path = Path(out_dir) / "Final_Quantum_Profiles.csv"
+    csv_path = Path("artifacts") / "Final_Quantum_Profiles.csv"
     try:
-        if single_mode and profile_path.exists():
-            q_profile.to_csv(profile_path, mode="a", header=False, index=False)
+        if single_mode and csv_path.exists():
+            q_profile.to_csv(csv_path, mode="a", header=False, index=False)
         else:
-            q_profile.to_csv(profile_path, index=False)
+            q_profile.to_csv(csv_path, index=False)
     finally:
         try:
-            if profile_path.exists():
-                os.chmod(profile_path, 0o777)
+            if csv_path.exists():
+                os.chmod(csv_path, 0o777)
         except Exception:
             pass
     # Top 5 H-Bond stability table (by HBondCap)
@@ -1092,7 +1094,8 @@ def main(args: argparse.Namespace) -> None:
         f.write("\n".join(conclusion_lines))
 
     if single_mode:
-        print(f"SUCCESS: Saved {pdb_id_single} to {profile_path.resolve()}")
+        print(f"SUCCESS: Saved {pdb_id_single} to {csv_path.resolve()}")
+        print("VQE_COMPLETE")
 
     print(json.dumps(summary, indent=2))
     print("Final MAE:", mae_final)
