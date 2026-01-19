@@ -16,6 +16,10 @@ from sklearn.cluster import KMeans
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern, WhiteKernel, ConstantKernel
 from sklearn.metrics import mean_absolute_error, median_absolute_error, r2_score
+try:
+    from scipy.stats import pearsonr
+except ImportError:  # pragma: no cover
+    pearsonr = None
 
 MV_TO_AU = 0.01
 H_HOP = 0.02
@@ -787,18 +791,25 @@ def main(args: argparse.Namespace) -> None:
     corr_gap = float("nan")
     corr_polar = float("nan")
     corr_spin = float("nan")
+    p_spin = float("nan")
     for col, var in [("homo_lumo_gap", "gap"), ("quantum_polarizability", "polar"), ("n5_spin_density", "spin")]:
         arr = res_df[[col, "true_Em"]].dropna()
         if len(arr) > 1 and arr[col].std(ddof=0) > 0:
-            val = np.corrcoef(arr[col], arr["true_Em"])[0, 1]
+            if pearsonr is not None:
+                val, pval = pearsonr(arr[col], arr["true_Em"])
+            else:
+                val = np.corrcoef(arr[col], arr["true_Em"])[0, 1]
+                pval = float("nan")
         else:
             val = float("nan")
+            pval = float("nan")
         if var == "gap":
             corr_gap = val
         elif var == "polar":
             corr_polar = val
         else:
             corr_spin = val
+            p_spin = pval
 
     # Correlation between GPR residual and ST gap
     res_with_gap = res_df.dropna(subset=["st_gap"])
@@ -856,6 +867,18 @@ def main(args: argparse.Namespace) -> None:
     plt.title("Spin vs Error Analysis (Failures highlighted)")
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, "Spin_vs_Error_Analysis.png"), dpi=150)
+    plt.close()
+
+    # Physics consistency plot: N5 spin vs Em with p-value
+    plt.figure(figsize=(6, 5))
+    plt.scatter(res_df["n5_spin_density"], res_df["true_Em"], alpha=0.7)
+    plt.xlabel("N5 Spin Density")
+    plt.ylabel("Experimental Em (mV)")
+    plt.title("Physics Consistency: N5 Spin vs Em")
+    if not np.isnan(p_spin):
+        plt.annotate(f"r={corr_spin:.3f}, p={p_spin:.3f}", xy=(0.05, 0.95), xycoords="axes fraction", va="top")
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "Physics_Consistency.png"), dpi=150)
     plt.close()
 
     # Quantum property validation plot
