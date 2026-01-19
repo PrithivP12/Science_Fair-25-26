@@ -16,28 +16,19 @@ TARGET_COL = "Em"
 class PreprocessReport:
     rows_before: int
     rows_after: int
-    num_groups: int
-    n_meas_stats: Dict[str, float]
+    exact_duplicates_dropped: int
     frac_missing_ph_before: float
     frac_missing_ph_after: float
     frac_missing_temp_before: float
     frac_missing_temp_after: float
     widest_proteins: pd.DataFrame
+    group_stats: Dict[str, float]
 
 
 def _coerce_float(series: pd.Series) -> pd.Series:
     if series is None:
         return pd.Series(dtype=float)
     return pd.to_numeric(series.replace(r"^\s*$", np.nan, regex=True), errors="coerce")
-
-
-def _condition_key(row: pd.Series) -> Tuple[Any, ...]:
-    return (
-        row.get("uniprot_id", "NA"),
-        row.get("cofactor", "missing"),
-        row.get("pH_rounded", "NA"),
-        row.get("temperature_rounded", "NA"),
-    )
 
 
 def preprocess_dataframe(df: pd.DataFrame) -> Tuple[pd.DataFrame, PreprocessReport]:
@@ -55,6 +46,12 @@ def preprocess_dataframe(df: pd.DataFrame) -> Tuple[pd.DataFrame, PreprocessRepo
     # Drop rows without target
     df = df[df[TARGET_COL].notna()].copy()
 
+    # Drop exact duplicates only
+    dedup_subset = ["uniprot_id", "pdb_id", "Em", "pH", "temperature_C"]
+    before_dedup = len(df)
+    df = df.drop_duplicates(subset=dedup_subset)
+    exact_duplicates_dropped = before_dedup - len(df)
+
     # Flags and condition features
     df["has_pH"] = df["pH"].notna().astype(int)
     df["has_temp"] = df["temperature_C"].notna().astype(int)
@@ -62,62 +59,30 @@ def preprocess_dataframe(df: pd.DataFrame) -> Tuple[pd.DataFrame, PreprocessRepo
     df["pH_sq"] = df["pH_centered"] ** 2
     df["temperature_centered"] = df["temperature_C"] - 25.0
 
-    # Rounding bins
-    df["pH_rounded"] = df["pH"].apply(lambda x: round(x * 2) / 2 if pd.notna(x) else np.nan)
-    df["temperature_rounded"] = df["temperature_C"].apply(lambda x: round(x / 5) * 5 if pd.notna(x) else np.nan)
+    # Bins for group stats (but keep all rows)
+    df["pH_bin"] = df["pH"].apply(lambda x: round(x * 2) / 2 if pd.notna(x) else "missing")
+    df["temp_bin"] = df["temperature_C"].apply(lambda x: round(x / 5) * 5 if pd.notna(x) else "missing")
+    df["pH_bin"] = df["pH_bin"].astype(str)
+    df["temp_bin"] = df["temp_bin"].astype(str)
 
-    # Condition key and dedup
-    df["cofactor"] = df.get("cofactor", "missing").fillna("missing")
-    df["cond_key"] = df.apply(_condition_key, axis=1)
+    # Group stats per (uniprot_id, pH_bin, temp_bin)
+    grp = df.groupby(["uniprot_id", "pH_bin", "temp_bin"])
+    stats = grp[TARGET_COL].agg(["std", "count"]).rename(columns={"std": "group_std", "count": "group_n"})
+    stats["group_std"] = stats["group_std"].fillna(0.0)
+    stats = stats.reset_index()
+    df = df.merge(stats, on=["uniprot_id", "pH_bin", "temp_bin"], how="left")
+    df["sample_weight"] = 1.0 / (df["group_std"] + 1.0)
+    df["sample_weight"] = df["sample_weight"].replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    df["sample_weight"] = df["sample_weight"].clip(lower=1e-3)
 
-    grouped = df.groupby("cond_key")
-    agg_df = grouped.agg(
-        {
-            TARGET_COL: ["mean", "std", "count"],
-            "pH": "first",
-            "temperature_C": "first",
-            "pH_centered": "first",
-            "pH_sq": "first",
-            "temperature_centered": "first",
-            "has_pH": "first",
-            "has_temp": "first",
-            "pH_rounded": "first",
-            "temperature_rounded": "first",
-            "cofactor": "first",
-            "uniprot_id": "first",
-            "pdb_id": "first",
-        }
-    ).reset_index(drop=True)
-    agg_df.columns = [
-        "Em_mean",
-        "Em_std",
-        "n_measurements",
-        "pH",
-        "temperature_C",
-        "pH_centered",
-        "pH_sq",
-        "temperature_centered",
-        "has_pH",
-        "has_temp",
-        "pH_rounded",
-        "temperature_rounded",
-        "cofactor",
-        "uniprot_id",
-        "pdb_id",
-    ]
-    agg_df["Em"] = agg_df["Em_mean"]
-    agg_df["Em_std"] = agg_df["Em_std"].fillna(0.0)
+    frac_missing_ph_after = float(df["pH"].isna().mean())
+    frac_missing_temp_after = float(df["temperature_C"].isna().mean())
 
-    frac_missing_ph_after = float(agg_df["pH"].isna().mean())
-    frac_missing_temp_after = float(agg_df["temperature_C"].isna().mean())
-
-    # n_measurements distribution stats
-    n_meas = agg_df["n_measurements"]
-    n_meas_stats = {
-        "min": float(n_meas.min()),
-        "max": float(n_meas.max()),
-        "mean": float(n_meas.mean()),
-        "median": float(n_meas.median()),
+    group_stats = {
+        "group_n_min": float(df["group_n"].min()),
+        "group_n_max": float(df["group_n"].max()),
+        "group_n_mean": float(df["group_n"].mean()),
+        "group_n_median": float(df["group_n"].median()),
     }
 
     # Proteins with widest Em range across conditions (from original df)
@@ -127,16 +92,16 @@ def preprocess_dataframe(df: pd.DataFrame) -> Tuple[pd.DataFrame, PreprocessRepo
 
     report = PreprocessReport(
         rows_before=rows_before,
-        rows_after=len(agg_df),
-        num_groups=len(agg_df),
-        n_meas_stats=n_meas_stats,
+        rows_after=len(df),
+        exact_duplicates_dropped=exact_duplicates_dropped,
         frac_missing_ph_before=frac_missing_ph_before,
         frac_missing_ph_after=frac_missing_ph_after,
         frac_missing_temp_before=frac_missing_temp_before,
         frac_missing_temp_after=frac_missing_temp_after,
         widest_proteins=widest,
+        group_stats=group_stats,
     )
-    return agg_df, report
+    return df, report
 
 
 def _write_report(report: PreprocessReport, path: Path) -> None:
@@ -145,7 +110,7 @@ def _write_report(report: PreprocessReport, path: Path) -> None:
         f.write("# Preprocess Report\n\n")
         f.write(f"- Rows before: {report.rows_before}\n")
         f.write(f"- Rows after dedup: {report.rows_after}\n")
-        f.write(f"- Deduplicated condition groups: {report.num_groups}\n")
+        f.write(f"- Exact duplicates dropped: {report.exact_duplicates_dropped}\n")
         f.write(
             f"- Missing pH: before {report.frac_missing_ph_before*100:.2f}% | after {report.frac_missing_ph_after*100:.2f}%\n"
         )
@@ -153,8 +118,8 @@ def _write_report(report: PreprocessReport, path: Path) -> None:
             f"- Missing temperature: before {report.frac_missing_temp_before*100:.2f}% | after {report.frac_missing_temp_after*100:.2f}%\n"
         )
         f.write(
-            f"- n_measurements stats: min={report.n_meas_stats['min']}, median={report.n_meas_stats['median']}, "
-            f"mean={report.n_meas_stats['mean']:.2f}, max={report.n_meas_stats['max']}\n"
+            f"- group_n stats: min={report.group_stats['group_n_min']}, median={report.group_stats['group_n_median']}, "
+            f"mean={report.group_stats['group_n_mean']:.2f}, max={report.group_stats['group_n_max']}\n"
         )
         f.write("\n## Proteins with widest Em range\n")
         f.write("uniprot_id,min,max,Em_range\n")

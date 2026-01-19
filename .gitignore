@@ -8,3 +8,4 @@ catboost_info/
 # Local data outputs
 data/redox_dataset_preprocessed.csv
 data/redox_dataset_preprocessed.parquet
+data/redox_dataset_merged.csv

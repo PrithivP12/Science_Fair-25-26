@@ -55,6 +55,15 @@ def _write_condition_audit(df: pd.DataFrame, out_path: str) -> None:
         f.write(f"- Percent missing pH among multi-measurement proteins: {pct_missing_ph:.2f}%\n")
 
 
+def _compute_slice_metrics(df: pd.DataFrame, y_true: np.ndarray, y_pred: np.ndarray, mask: np.ndarray) -> Dict[str, float]:
+    if mask.sum() == 0:
+        return {k: float("nan") for k in ["mae", "rmse", "r2", "within_25", "within_50", "median_ae"]}
+    metrics = regression_metrics(y_true[mask], y_pred[mask])
+    tol = tolerance_metrics(y_true[mask], y_pred[mask])
+    metrics.update(tol)
+    return metrics
+
+
 def _baseline_map(df: pd.DataFrame, indices: List[int]) -> Tuple[Dict[str, float], float]:
     sub = df.iloc[indices]
     grouped = sub.groupby("uniprot_id")["Em"].mean()
@@ -77,20 +86,8 @@ def _get_catboost():
         ) from exc
 
 
-def _get_lightgbm():
-    try:
-        from lightgbm import LGBMRegressor
-        return LGBMRegressor
-    except Exception:
-        return None
-
-
 def _get_xgboost():
-    try:
-        from xgboost import XGBRegressor
-        return XGBRegressor
-    except Exception:
-        return None
+    return None
 
 
 def _make_dirs(artifacts_dir: str) -> Dict[str, str]:
@@ -527,9 +524,14 @@ def _predict_model(
         model = info["model"]
         return model.predict(pre.transform(X_df)) + base_vals
     if name == "ensemble":
-        cat_pred = _predict_model("catboost", models, spec, X_df, cat_medians)
-        xgb_pred = _predict_model("xgb", models, spec, X_df, cat_medians)
-        return 0.5 * (cat_pred + xgb_pred)
+        parts = []
+        if "catboost" in models:
+            parts.append(_predict_model("catboost", models, spec, X_df, cat_medians))
+        if "extratrees" in models:
+            parts.append(_predict_model("extratrees", models, spec, X_df, cat_medians))
+        if not parts:
+            raise ValueError("Ensemble has no base models")
+        return np.mean(parts, axis=0)
     return models[name].predict(X_df)
 
 
@@ -583,9 +585,9 @@ def _compute_oof_preds(
         elif name == "ensemble":
             cat_model, med = _train_catboost(spec, X_tr, y_tr, X_va, y_va, cat_params, sample_weight=sw)
             cat_preds = cat_model.predict(prepare_catboost_frame(X_va, spec, medians=med)[0])
-            xgb_model, pre = _train_xgboost(spec, X_tr, y_tr, X_va, y_va, xgb_params, sample_weight=sw)
-            xgb_preds = xgb_model.predict(pre.transform(X_va))
-            preds = 0.5 * (cat_preds + xgb_preds)
+            et_model, pre = _train_extratrees(spec, X_tr, y_tr, X_va, y_va, {}, sample_weight=sw)
+            et_preds = et_model.predict(pre.transform(X_va))
+            preds = 0.5 * (cat_preds + et_preds)
         else:
             return None
         oof[val_idx] = preds
@@ -875,32 +877,6 @@ def run_training(config_path: str, tune_override: Optional[bool] = None, models_
             logging.error("Model catboost failed: %s", exc)
             models_failed["catboost"] = str(exc)
 
-    # LightGBM optional
-    LGBMRegressor = _get_lightgbm()
-    if LGBMRegressor is not None:
-        try:
-            lgbm_model = LGBMRegressor(random_state=config.random_seed)
-            lgbm_pipe = Pipeline(steps=[("preprocess", make_linear_preprocessor(spec)), ("model", lgbm_model)])
-            lgbm_pipe.fit(X_train, y_train)
-            models["lightgbm"] = lgbm_pipe
-            metrics_by_model["lightgbm"] = {
-                "train": _eval_split(df.iloc[splits["train"]], y_train, lgbm_pipe.predict(X_train)),
-                "val": _eval_split(df.iloc[splits["val"]], y_val, lgbm_pipe.predict(X_val)),
-                "test": _eval_split(df.iloc[splits["test"]], y_test, lgbm_pipe.predict(X_test)),
-            }
-            bundles["lightgbm"] = {
-                "model_type": "lightgbm",
-                "model": lgbm_pipe,
-                "feature_cols": spec.feature_cols,
-                "categorical_cols": spec.categorical_cols,
-                "numeric_cols": spec.numeric_cols,
-                "dropped_all_nan": spec.dropped_all_nan,
-            }
-            models_succeeded.append("lightgbm")
-        except Exception as exc:
-            logging.error("Model lightgbm failed: %s", exc)
-            models_failed["lightgbm"] = str(exc)
-
     # XGBoost
     if "xgb" in model_enabled:
         try:
@@ -964,6 +940,42 @@ def run_training(config_path: str, tune_override: Optional[bool] = None, models_
         except Exception as exc:
             logging.error("Model extratrees failed: %s", exc)
             models_failed["extratrees"] = str(exc)
+
+    # Simple ensemble of catboost + extratrees
+    if "ensemble" in model_enabled and "catboost" in models and "extratrees" in models:
+        try:
+            preds_train = 0.5 * (
+                _predict_model("catboost", models, spec, X_train, cat_medians)
+                + _predict_model("extratrees", models, spec, X_train, cat_medians)
+            )
+            preds_val = 0.5 * (
+                _predict_model("catboost", models, spec, X_val, cat_medians)
+                + _predict_model("extratrees", models, spec, X_val, cat_medians)
+            )
+            preds_test = 0.5 * (
+                _predict_model("catboost", models, spec, X_test, cat_medians)
+                + _predict_model("extratrees", models, spec, X_test, cat_medians)
+            )
+            metrics_by_model["ensemble"] = {
+                "train": _eval_split(df.iloc[splits["train"]], y_train, preds_train),
+                "val": _eval_split(df.iloc[splits["val"]], y_val, preds_val),
+                "test": _eval_split(df.iloc[splits["test"]], y_test, preds_test),
+            }
+            bundles["ensemble"] = {
+                "model_type": "ensemble",
+                "catboost_model": {
+                    "model": models["catboost"],
+                    "numeric_medians": cat_medians,
+                    "categorical_cols": spec.categorical_cols,
+                    "numeric_cols": spec.numeric_cols,
+                },
+                "extratrees_model": models["extratrees"],
+                "feature_cols": spec.feature_cols,
+            }
+            models_succeeded.append("ensemble")
+        except Exception as exc:
+            logging.error("Model ensemble failed: %s", exc)
+            models_failed["ensemble"] = str(exc)
 
     # CatBoost delta-to-baseline
     if "catboost_delta" in model_enabled:
@@ -1132,29 +1144,22 @@ def run_training(config_path: str, tune_override: Optional[bool] = None, models_
                 {"fold": fold_idx, "metrics": regression_metrics(y_va, cat_cv.predict(X_va_cb))}
             )
 
-        if "xgb" in models_succeeded:
+        if "extratrees" in models_succeeded:
             sw = sample_weight.iloc[train_idx].values if sample_weight is not None else None
-            xgb_cv, xgb_pre = _train_xgboost(spec, X_tr, y_tr, X_va, y_va, xgb_params, sample_weight=sw)
-            cv_metrics["xgb"]["folds"].append(
-                {"fold": fold_idx, "metrics": regression_metrics(y_va, xgb_cv.predict(xgb_pre.transform(X_va)))}
+            et_cv, et_pre = _train_extratrees(spec, X_tr, y_tr, X_va, y_va, extra_params, sample_weight=sw)
+            cv_metrics["extratrees"]["folds"].append(
+                {"fold": fold_idx, "metrics": regression_metrics(y_va, et_cv.predict(et_pre.transform(X_va)))}
             )
 
-        if "ensemble" in models_succeeded:
+        if "ensemble" in models_succeeded and "catboost" in models_succeeded and "extratrees" in models_succeeded:
             sw = sample_weight.iloc[train_idx].values if sample_weight is not None else None
             cat_cv, med_cv = _train_catboost(spec, X_tr, y_tr, X_va, y_va, cat_params, sample_weight=sw)
-            xgb_cv, xgb_pre = _train_xgboost(spec, X_tr, y_tr, X_va, y_va, xgb_params, sample_weight=sw)
+            et_cv, et_pre = _train_extratrees(spec, X_tr, y_tr, X_va, y_va, extra_params, sample_weight=sw)
             cat_pred = cat_cv.predict(prepare_catboost_frame(X_va, spec, medians=med_cv)[0])
-            xgb_pred = xgb_cv.predict(xgb_pre.transform(X_va))
-            ens_pred = 0.5 * (cat_pred + xgb_pred)
+            et_pred = et_cv.predict(et_pre.transform(X_va))
+            ens_pred = 0.5 * (cat_pred + et_pred)
             cv_metrics["ensemble"]["folds"].append(
                 {"fold": fold_idx, "metrics": regression_metrics(y_va, ens_pred)}
-            )
-
-        if "lightgbm" in models_succeeded:
-            lgbm_cv = Pipeline(steps=[("preprocess", make_linear_preprocessor(spec)), ("model", LGBMRegressor(random_state=config.random_seed))])
-            lgbm_cv.fit(X_tr, y_tr)
-            cv_metrics["lightgbm"]["folds"].append(
-                {"fold": fold_idx, "metrics": regression_metrics(y_va, lgbm_cv.predict(X_va))}
             )
 
     # Save models
@@ -1208,7 +1213,6 @@ def run_training(config_path: str, tune_override: Optional[bool] = None, models_
         spec,
         X_test,
         cat_medians,
-        uniprot=df.iloc[splits["test"]]["uniprot_id"],
     )
     plot_diagnostics(
         y_test,
@@ -1274,6 +1278,17 @@ def run_training(config_path: str, tune_override: Optional[bool] = None, models_
     test_resid_df.sort_values("abs_error", ascending=False).head(50)[keep_cols].to_csv(
         os.path.join(paths["reports"], "top_residuals_test.csv"), index=False
     )
+
+    # Condition slices on test
+    df_test = df.iloc[splits["test"]].copy()
+    mask_known_ph = df_test["has_pH"] == 1
+    mask_neutral = mask_known_ph & df_test["pH"].between(6.5, 7.5)
+    mask_missing_ph = df_test["has_pH"] == 0
+    slice_metrics = {
+        "Slice A (pH 6.5-7.5, known)": _compute_slice_metrics(df_test, y_test, best_test_pred, mask_neutral.values),
+        "Slice B (known pH)": _compute_slice_metrics(df_test, y_test, best_test_pred, mask_known_ph.values),
+        "Slice C (missing pH)": _compute_slice_metrics(df_test, y_test, best_test_pred, mask_missing_ph.values),
+    }
 
     # Permutation importance on test set
     try:
@@ -1351,6 +1366,12 @@ def run_training(config_path: str, tune_override: Optional[bool] = None, models_
         f.write(f"- Figures: {paths['figures']}\n")
         if shap_note:
             f.write(f"\nNote: SHAP summary skipped ({shap_note}).\n")
+        f.write("\n## Test slices (best model)\n")
+        for name, m in slice_metrics.items():
+            f.write(
+                f"- {name}: MAE={m['mae']:.3f}, RMSE={m['rmse']:.3f}, R2={m['r2']:.3f}, "
+                f"within_25={m['within_25']:.3f}, within_50={m['within_50']:.3f}, median_ae={m['median_ae']:.3f}\n"
+            )
 
     # Improvement report (baseline ~40 mV MAE as provided)
     baseline_mae = 40.0

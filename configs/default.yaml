@@ -6,7 +6,7 @@ selection_metric: MAE
 selection_split: cv
 tuning: true
 tune_trials: 20
-models: [dummy, ridge, catboost, xgb, extratrees, catboost_delta, xgb_delta, ensemble]
+models: [catboost, extratrees, ensemble]
 ensemble: true
 
 data:
