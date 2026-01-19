@@ -14,6 +14,10 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.cluster import KMeans
+from sklearn.exceptions import ConvergenceWarning
+import warnings
+
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern, WhiteKernel, ConstantKernel
 from sklearn.metrics import mean_absolute_error, median_absolute_error, r2_score
@@ -388,6 +392,11 @@ def train_gpr(df: pd.DataFrame) -> GaussianProcessRegressor:
 
 def cluster_labels(df: pd.DataFrame) -> Tuple[np.ndarray, Dict[int, str]]:
     feats = df[["Around_N5_IsoelectricPoint", "Around_N5_HBondCap"]].values
+    if len(df) < 2:
+        labels = np.array([0] * len(df))
+        cluster_map = {0: "single_upload"}
+        fam_labels = np.array([cluster_map[l] for l in labels])
+        return fam_labels, cluster_map
     km = KMeans(n_clusters=2, random_state=42, n_init=10)
     labels = km.fit_predict(feats)
     centroids = km.cluster_centers_
@@ -406,7 +415,7 @@ def main(args: argparse.Namespace) -> None:
     if single_mode:
         # Create a placeholder entry using dataset means for missing fields
         mean_row = df.mean(numeric_only=True)
-        pdb_id_single = Path(args.pdb).stem if hasattr(args, "pdb") else "UNKNOWN"
+        pdb_id_single = Path(args.pdb).stem.upper() if hasattr(args, "pdb") else "UNKNOWN"
         single_entry = {
             "pdb_id": pdb_id_single,
             "uniprot_id": "NA",
@@ -626,13 +635,17 @@ def main(args: argparse.Namespace) -> None:
             "magnetic_sensitivity_index",
         ]
     ]
-    profile_path = os.path.join(out_dir, "Final_Quantum_Profiles.csv")
-    if single_mode and os.path.exists(profile_path):
-        existing = pd.read_csv(profile_path, low_memory=False)
-        combined = pd.concat([existing, q_profile], ignore_index=True)
-        combined.to_csv(profile_path, index=False)
+    profile_path = Path(out_dir) / "Final_Quantum_Profiles.csv"
+    if single_mode and profile_path.exists():
+        with open(profile_path, "a", encoding="utf-8") as f:
+            q_profile.to_csv(f, mode="a", header=False, index=False)
+            f.flush()
+            os.fsync(f.fileno())
     else:
-        q_profile.to_csv(profile_path, index=False)
+        with open(profile_path, "w", encoding="utf-8") as f:
+            q_profile.to_csv(f, index=False)
+            f.flush()
+            os.fsync(f.fileno())
     # Top 5 H-Bond stability table (by HBondCap)
     top5_hbond = res_df.sort_values("Around_N5_HBondCap", ascending=False).head(5)
     top5_hbond[["pdb_id", "Around_N5_HBondCap", "homo_lumo_gap"]].to_csv(
@@ -1076,6 +1089,9 @@ def main(args: argparse.Namespace) -> None:
     ]
     with open(os.path.join(out_dir, "Study_Conclusion.txt"), "w", encoding="utf-8") as f:
         f.write("\n".join(conclusion_lines))
+
+    if single_mode:
+        print(f"SUCCESS: Saved {pdb_id_single} to {profile_path.resolve()}")
 
     print(json.dumps(summary, indent=2))
     print("Final MAE:", mae_final)

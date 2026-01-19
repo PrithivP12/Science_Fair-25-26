@@ -107,6 +107,9 @@ def main():
         if bulk_row is None or q_row is None:
             st.warning("Calculation pending for this molecule. Please wait for the VQE engine to finish.")
         else:
+            # PNAS needle check for this PDB (e.g., FAD)
+            st_gap = float(q_row.get("st_gap", float("nan")))
+            n5_spin = float(q_row.get("n5_spin_density", float("nan")))
             st.subheader("Quantum Profile")
             st.json({
                 "ST_Gap (mV)": float(q_row.get("st_gap", float("nan"))),
@@ -118,8 +121,6 @@ def main():
             })
 
             st.subheader("Magnetoreception Gauge")
-            st_gap = float(q_row.get("st_gap", float("nan")))
-            n5_spin = float(q_row.get("n5_spin_density", float("nan")))
             candidate = q_row.get("Magnetoreception_Candidate", False)
             st.metric(
                 "Heading Precision Index",
@@ -153,6 +154,17 @@ def main():
         st.sidebar.json(scorecard)
     else:
         st.sidebar.info("Run scripts/vqe_n5_edge.py to generate artifacts.")
+    if st.sidebar.button("Refresh Data"):
+        st.cache_data.clear()
+        bulk, qprof, scorecard = load_data(st.session_state.get("reload_token", 0))
+    debug_path = QUANTUM_PROFILES
+    if debug_path.exists():
+        st.sidebar.markdown("**Final_Quantum_Profiles tail**")
+        try:
+            tail = pd.read_csv(debug_path).tail(5)
+            st.sidebar.dataframe(tail)
+        except Exception as exc:
+            st.sidebar.write(f"Debug read failed: {exc}")
     top5_path = ARTIFACT_DIR / "Top5_HBond_Stability.csv"
     if top5_path.exists():
         st.sidebar.markdown("**Top 5 H-Bond Stability**")
