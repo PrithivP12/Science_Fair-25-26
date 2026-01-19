@@ -59,6 +59,20 @@ def main():
     st.title("Quantum Needle: Phase 6 Hybrid GPR–VQE Dashboard")
     reload_token = st.session_state.get("reload_token", 0)
     bulk, qprof, scorecard = load_data(reload_token)
+    # Auto-run training if database appears empty
+    if bulk.empty or qprof.empty:
+        with st.spinner("Database empty. Running full Phase 6 dataset to populate artifacts..."):
+            proc = subprocess.run(
+                [sys.executable, "scripts/vqe_n5_edge.py", "--data", "data/redox_dataset_preprocessed.csv"],
+                capture_output=True,
+                text=True,
+            )
+        if proc.returncode != 0:
+            st.error(f"Dataset rebuild failed: {proc.stderr.strip() or proc.stdout.strip() or 'Unknown error'}")
+            return
+        st.cache_data.clear()
+        st.session_state["reload_token"] = reload_token + 1
+        bulk, qprof, scorecard = load_data(st.session_state["reload_token"])
 
     if qprof.empty:
         available_ids = []
