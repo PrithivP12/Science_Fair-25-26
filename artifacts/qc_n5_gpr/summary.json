@@ -1,0 +1,39 @@
+{
+  "global_mae": {
+    "gpr": 47.27703551796122,
+    "hybrid": 47.27703551796122
+  },
+  "global_medae": 34.11288096785486,
+  "global_r2": {
+    "gpr": 0.6267718857854672,
+    "hybrid": 0.6267718857854672
+  },
+  "chemical_hits_43mV": 85,
+  "chemical_hits_36mV": 74,
+  "mean_error_reduction": 0.0,
+  "percent_improved": 0.0,
+  "success_profile_lt36": {
+    "count_lt36": 74,
+    "mean_flexibility": 1.3518918918918919,
+    "mean_hbondcap": 2.189189189189189
+  },
+  "feature_contrast_file": "feature_contrast_success_vs_failure.csv",
+  "failure_cases_file": "failure_cases_gt80.csv",
+  "divergence_major_file": "divergence_major_gt150.csv",
+  "failure_mae_4q_baseline": 150.9560570049274,
+  "failure_mae_escalated": 160.1077665256911,
+  "failure_error_correlation_R": 0.2250949360069739,
+  "clean_room": {
+    "mae": 35.54263949315731,
+    "medae": 30.41765810856839,
+    "r2": 0.7866514506886799,
+    "hit_pct_lt36": 59.2,
+    "hit_pct_lt43": 67.2
+  },
+  "global_lock_applied": true,
+  "quantum_property_correlations": {
+    "homo_lumo_gap_vs_Em": 0.15766480226202742,
+    "polarizability_vs_Em": 0.12837575531416479,
+    "n5_spin_density_vs_Em": 0.07681678288704041
+  }
+}

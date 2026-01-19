@@ -207,6 +207,17 @@ def exact_ground(H: np.ndarray) -> float:
     return float(np.real(np.min(w)))
 
 
+def block_ground_props(H: np.ndarray, z_ops: np.ndarray) -> Tuple[float, float, float]:
+    """Return ground energy, HOMO-LUMO gap, and Z expectation on provided operator."""
+    vals, vecs = np.linalg.eigh(H)
+    vals = np.real(vals)
+    ground = float(vals[0])
+    gap = float(vals[1] - vals[0]) if len(vals) > 1 else float("nan")
+    v0 = vecs[:, 0]
+    z_exp = float(np.real(np.vdot(v0, z_ops @ v0)))
+    return ground, gap, z_exp
+
+
 def interpolate_params(iso: float, flex: float, hb: float, fam: str) -> Dict[str, float]:
     base_iso = -0.008
     iso_scale = base_iso + 0.005 * flex
@@ -329,10 +340,13 @@ def predict_energy_16q(row, params: Dict[str, float], mv_to_au: float, gpr_basel
     H_c10 = build_hamiltonian_4q(eps_c10, 0.0, g_c10, H_HOP * 0.6 / eps_eff, flex, cross_scale * 0.6)
     H_ringc = build_hamiltonian_4q(eps_ringc, 0.0, g_ringc, H_HOP * 0.5 / eps_eff, flex, cross_scale * 0.5)
 
-    e_n5 = exact_ground(H_n5)
-    e_c4a = exact_ground(H_c4a)
-    e_c10 = exact_ground(H_c10)
-    e_ringc = exact_ground(H_ringc)
+    I, _, _, Z = pauli_mats()
+    Zsum = kron_n(Z, I, I, I) + kron_n(I, Z, I, I) + kron_n(I, I, Z, I) + kron_n(I, I, I, Z)
+
+    e_n5, gap_n5, spin_n5 = block_ground_props(H_n5, Zsum)
+    e_c4a, gap_c4a, _ = block_ground_props(H_c4a, Zsum)
+    e_c10, gap_c10, _ = block_ground_props(H_c10, Zsum)
+    e_ringc, gap_ringc, _ = block_ground_props(H_ringc, Zsum)
 
     coupling_const = cross_scale * (1.0 + 0.3 * complexity)
     energy_mv = (e_n5 + e_c4a + e_c10 + e_ringc) / mv_to_au + coupling_const * 5.0
@@ -340,7 +354,13 @@ def predict_energy_16q(row, params: Dict[str, float], mv_to_au: float, gpr_basel
     pi_stack_score = float(row.get("Pi_Stack_Score", 0.0))
     pi_shift = -25.0 * pi_stack_score
 
-    return energy_mv + pi_shift
+    profile = {
+        "homo_lumo_gap": float(gap_n5 + gap_c4a + gap_c10 + gap_ringc),
+        "polarizability": float((hb + c4a_pol + c10_proxy + ringc_proxy) / max(eps_eff, 1e-6)),
+        "n5_spin_density": float(spin_n5 / 4.0),
+    }
+
+    return energy_mv + pi_shift, profile
 
 
 def train_gpr(df: pd.DataFrame) -> GaussianProcessRegressor:
@@ -420,6 +440,7 @@ def main(args: argparse.Namespace) -> None:
             pred_gpr = gpr_mean + 0.7 * (pred_gpr_raw - gpr_mean)
         else:
             pred_gpr = pred_gpr_raw
+        profile_used = {}
 
         # pure quantum prediction (no offsets/caps)
         pred_4q_raw = predict_energy_4q(row, params, MV_TO_AU, gpr_baseline=pred_gpr_raw, fam=fam) * QUANTUM_SCALE
@@ -463,7 +484,8 @@ def main(args: argparse.Namespace) -> None:
         pdb_upper = str(row.get("pdb_id", "")).upper()
         if pdb_upper in miss_ids:
             # 16Q targeted escalation for misses
-            pred_q = predict_energy_16q(row, params, MV_TO_AU, gpr_baseline=pred_gpr_raw, complexity=complexity, fam=fam) * QUANTUM_SCALE
+            pred_q_raw, profile = predict_energy_16q(row, params, MV_TO_AU, gpr_baseline=pred_gpr_raw, complexity=complexity, fam=fam)
+            pred_q = pred_q_raw * QUANTUM_SCALE
             delta_q = pred_q - pred_gpr
             if abs(delta_q) > 100.0:
                 nudge = 0.0
@@ -473,6 +495,7 @@ def main(args: argparse.Namespace) -> None:
             used_model = "hybrid_16q"
             pred_q_used = pred_q
             nudge_factor_used = NUDGE_FACTOR_16Q
+            profile_used = profile
         elif escalate:
             pred_q = predict_energy_8q(row, params, MV_TO_AU, gpr_baseline=pred_gpr_raw, fam=fam) * QUANTUM_SCALE
             solvent_factor = (flex_val * 0.5) + (complexity * 0.2)
@@ -501,6 +524,7 @@ def main(args: argparse.Namespace) -> None:
             used_model = "hybrid_8q"
             pred_q_used = pred_q
             nudge_factor_used = 0.04 if (delta_8q > 0 and gpr_residual > 0) or (delta_8q < 0 and gpr_residual < 0) else 0.0
+            profile_used = {}
         else:
             pred_q = pred_4q_raw
             quantum_delta = pred_q - pred_gpr
@@ -515,6 +539,7 @@ def main(args: argparse.Namespace) -> None:
             used_model = "hybrid_4q" if base_w_q > 0 else "gpr"
             pred_q_used = pred_q
             nudge_factor_used = NUDGE_FACTOR_4Q
+            profile_used = {}
 
         quantum_delta = pred_q_used - pred_gpr
 
@@ -541,6 +566,9 @@ def main(args: argparse.Namespace) -> None:
                 "used_model": used_model,
                 "Around_N5_Flexibility": flex_val,
                 "Around_N5_HBondCap": hb_val,
+                "homo_lumo_gap": float(profile_used.get("homo_lumo_gap", float("nan"))),
+                "quantum_polarizability": float(profile_used.get("polarizability", float("nan"))),
+                "n5_spin_density": float(profile_used.get("n5_spin_density", float("nan"))),
             }
         )
 
@@ -548,6 +576,9 @@ def main(args: argparse.Namespace) -> None:
     out_dir = "artifacts/qc_n5_gpr"
     os.makedirs(out_dir, exist_ok=True)
     res_df.to_csv(os.path.join(out_dir, "bulk_quantum_results.csv"), index=False)
+    res_df[["pdb_id", "true_Em", "gpr_pred", "pred_final", "homo_lumo_gap", "quantum_polarizability", "n5_spin_density"]].to_csv(
+        os.path.join(out_dir, "Final_Quantum_Profiles.csv"), index=False
+    )
 
     # Global MAE lock: if not improved, revert to GPR
     mae_initial = mean_absolute_error(res_df["true_Em"], res_df["pred_final"])
@@ -725,6 +756,23 @@ def main(args: argparse.Namespace) -> None:
     clean_hit_pct_36 = 100.0 * clean_hits_36 / len(clean_df) if len(clean_df) > 0 else 0.0
     clean_hit_pct_43 = 100.0 * clean_hits_43 / len(clean_df) if len(clean_df) > 0 else 0.0
 
+    # Quantum property correlations
+    corr_gap = float("nan")
+    corr_polar = float("nan")
+    corr_spin = float("nan")
+    for col, var in [("homo_lumo_gap", "gap"), ("quantum_polarizability", "polar"), ("n5_spin_density", "spin")]:
+        arr = res_df[[col, "true_Em"]].dropna()
+        if len(arr) > 1 and arr[col].std(ddof=0) > 0:
+            val = np.corrcoef(arr[col], arr["true_Em"])[0, 1]
+        else:
+            val = float("nan")
+        if var == "gap":
+            corr_gap = val
+        elif var == "polar":
+            corr_polar = val
+        else:
+            corr_spin = val
+
     # Clean-room plots
     plt.figure(figsize=(6, 6))
     plt.scatter(clean_df["true_Em"], clean_df["pred_final"], c="steelblue", alpha=0.7, label="Clean predictions")
@@ -820,6 +868,11 @@ def main(args: argparse.Namespace) -> None:
             "hit_pct_lt43": clean_hit_pct_43,
         },
         "global_lock_applied": lock_applied,
+        "quantum_property_correlations": {
+            "homo_lumo_gap_vs_Em": corr_gap,
+            "polarizability_vs_Em": corr_polar,
+            "n5_spin_density_vs_Em": corr_spin,
+        },
     }
     with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)

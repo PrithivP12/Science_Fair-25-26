@@ -1,0 +1,8 @@
+{
+  "global_mae_n139": 47.27703551796122,
+  "clean_room_mae_n129": 35.54263949315731,
+  "clean_room_r2": 0.7866514506886799,
+  "chemical_hits_lt43": 85,
+  "clean_room_hit_pct_lt36": 59.2,
+  "clean_room_hit_pct_lt43": 67.2
+}

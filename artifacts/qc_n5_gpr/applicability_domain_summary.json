@@ -1,0 +1,17 @@
+{
+  "success_profile_lt36": {
+    "count_lt36": 74,
+    "mean_flexibility": 1.3518918918918919,
+    "mean_hbondcap": 2.189189189189189
+  },
+  "success_means_gpr_based": {
+    "flex": 1.3523999999999998,
+    "hb": 2.1866666666666665,
+    "sigma": 84.45348809963654
+  },
+  "success_stds_gpr_based": {
+    "flex": 0.1081584023550644,
+    "hb": 1.1853925744476197,
+    "sigma": 5.199772096263385
+  }
+}

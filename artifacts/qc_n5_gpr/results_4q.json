@@ -1,0 +1,62 @@
+{
+  "params": {
+    "mv_to_au": 0.01,
+    "cross_scale": 0.01,
+    "h_hop": 0.02
+  },
+  "mae_gpr": 174.5990097175591,
+  "mae_quantum": 163.76067733996405,
+  "correction_pct": 6.207556615084899,
+  "edge_results": [
+    {
+      "index": 29,
+      "pdb_id": "1E0Y",
+      "uniprot_id": "P56216",
+      "true_Em_mV": 31.0,
+      "gpr_pred_mV": -209.35580118293595,
+      "quantum_pred_mV": -25.614907203841252,
+      "abs_err_gpr": 240.35580118293595,
+      "abs_err_quantum": 56.614907203841256
+    },
+    {
+      "index": 115,
+      "pdb_id": "3QFS",
+      "uniprot_id": "P16435",
+      "true_Em_mV": -399.5,
+      "gpr_pred_mV": -226.5234916848996,
+      "quantum_pred_mV": -477.07939244205414,
+      "abs_err_gpr": 172.9765083151004,
+      "abs_err_quantum": 77.57939244205414
+    },
+    {
+      "index": 114,
+      "pdb_id": "3QFS",
+      "uniprot_id": "P16435",
+      "true_Em_mV": -354.5,
+      "gpr_pred_mV": -197.33056502455923,
+      "quantum_pred_mV": -28.334716961569004,
+      "abs_err_gpr": 157.16943497544077,
+      "abs_err_quantum": 326.16528303843097
+    },
+    {
+      "index": 55,
+      "pdb_id": "1KF6",
+      "uniprot_id": "P00363",
+      "true_Em_mV": -55.0,
+      "gpr_pred_mV": -207.57113319244033,
+      "quantum_pred_mV": -29.202621012907002,
+      "abs_err_gpr": 152.57113319244033,
+      "abs_err_quantum": 25.797378987092998
+    },
+    {
+      "index": 123,
+      "pdb_id": "3ZBU",
+      "uniprot_id": "P21890",
+      "true_Em_mV": -358.0,
+      "gpr_pred_mV": -208.07782907812205,
+      "quantum_pred_mV": -25.353574971599063,
+      "abs_err_gpr": 149.92217092187795,
+      "abs_err_quantum": 332.6464250284009
+    }
+  ]
+}
