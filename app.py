@@ -1,5 +1,7 @@
 import io
 import json
+import os
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -14,7 +16,7 @@ FAILURE_10 = {"1CF3","1IJH","4MJW","1UMK","1NG4","1VAO","2GMJ","1E0Y","5K9B","1H
 CRITICAL_ST_GAP = 0.01
 
 @st.cache_data
-def load_data():
+def load_data(_reload_token: int = 0):
     bulk = pd.read_csv(BULK_RESULTS) if BULK_RESULTS.exists() else pd.DataFrame()
     qprof = pd.read_csv(QUANTUM_PROFILES) if QUANTUM_PROFILES.exists() else pd.DataFrame()
     scorecard = {}
@@ -47,7 +49,8 @@ def render_structure(pdb_id, pdb_text):
 
 def main():
     st.title("Quantum Needle: Phase 6 Hybrid GPR–VQE Dashboard")
-    bulk, qprof, scorecard = load_data()
+    reload_token = st.session_state.get("reload_token", 0)
+    bulk, qprof, scorecard = load_data(reload_token)
 
     available_ids = sorted(set(qprof["pdb_id"].astype(str).str.upper())) if not qprof.empty else []
     default_id = available_ids[0] if available_ids else ""
@@ -67,8 +70,30 @@ def main():
                 break
         if not pdb_id:
             pdb_id = pdb_file.name.replace(".pdb", "")
+        st.info("New Protein Detected: Initializing 16-Qubit VQE Engine...")
     elif pdb_input:
         pdb_id = pdb_input
+
+    # Auto-analysis for uploaded PDB not in artifacts
+    if pdb_file is not None and pdb_id and (qprof.empty or pdb_id.upper() not in set(qprof["pdb_id"].astype(str).str.upper())):
+        import tempfile
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdb") as tmp:
+            tmp.write(pdb_file.getvalue())
+            tmp_path = tmp.name
+        with st.spinner("Quantum simulation in progress... calculating Spin Density and ST-Gaps."):
+            proc = subprocess.run(
+                [sys.executable, "scripts/vqe_n5_edge.py", "--pdb", tmp_path],
+                capture_output=True,
+                text=True,
+            )
+        if proc.returncode != 0:
+            err_msg = proc.stderr.strip() or proc.stdout.strip() or "Unknown error"
+            st.error(f"VQE simulation failed: {err_msg}")
+            return
+        # reload data
+        st.session_state["reload_token"] = st.session_state.get("reload_token", 0) + 1
+        bulk, qprof, scorecard = load_data(st.session_state["reload_token"])
+        available_ids = sorted(set(qprof["pdb_id"].astype(str).str.upper())) if not qprof.empty else []
 
     if pdb_id:
         st.markdown(f"### Selected PDB: `{pdb_id}`")
