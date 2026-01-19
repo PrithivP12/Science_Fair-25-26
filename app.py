@@ -110,6 +110,7 @@ def main():
             # PNAS needle check for this PDB (e.g., FAD)
             st_gap = float(q_row.get("st_gap", float("nan")))
             n5_spin = float(q_row.get("n5_spin_density", float("nan")))
+            precision = 1.0 / (st_gap + 1e-6) if pd.notna(st_gap) else float("nan")
             st.subheader("Quantum Profile")
             st.json({
                 "ST_Gap (mV)": float(q_row.get("st_gap", float("nan"))),
@@ -118,6 +119,7 @@ def main():
                 "N10_Spin_Density": float(q_row.get("n10_spin_density", float("nan"))),
                 "Polarizability": float(q_row.get("quantum_polarizability", float("nan"))),
                 "Magnetic_Sensitivity": float(q_row.get("magnetic_sensitivity_index", float("nan"))),
+                "Quantum_Precision": precision,
             })
 
             st.subheader("Magnetoreception Gauge")
@@ -154,6 +156,21 @@ def main():
         st.sidebar.json(scorecard)
     else:
         st.sidebar.info("Run scripts/vqe_n5_edge.py to generate artifacts.")
+    if st.sidebar.button("Refresh Data"):
+        st.cache_data.clear()
+        bulk, qprof, scorecard = load_data(st.session_state.get("reload_token", 0))
+    debug_path = QUANTUM_PROFILES
+    if debug_path.exists():
+        try:
+            tail = pd.read_csv(debug_path).tail(5)
+            st.sidebar.markdown("**Final_Quantum_Profiles tail**")
+            st.sidebar.dataframe(tail)
+            if tail.empty:
+                st.error("Database is empty. Please run the full Phase 6 dataset script first.")
+        except Exception as exc:
+            st.sidebar.write(f"Debug read failed: {exc}")
+    else:
+        st.error("Database is empty. Please run the full Phase 6 dataset script first.")
     if st.sidebar.button("Refresh Data"):
         st.cache_data.clear()
         bulk, qprof, scorecard = load_data(st.session_state.get("reload_token", 0))

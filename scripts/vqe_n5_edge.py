@@ -636,16 +636,17 @@ def main(args: argparse.Namespace) -> None:
         ]
     ]
     profile_path = Path(out_dir) / "Final_Quantum_Profiles.csv"
-    if single_mode and profile_path.exists():
-        with open(profile_path, "a", encoding="utf-8") as f:
-            q_profile.to_csv(f, mode="a", header=False, index=False)
-            f.flush()
-            os.fsync(f.fileno())
-    else:
-        with open(profile_path, "w", encoding="utf-8") as f:
-            q_profile.to_csv(f, index=False)
-            f.flush()
-            os.fsync(f.fileno())
+    try:
+        if single_mode and profile_path.exists():
+            q_profile.to_csv(profile_path, mode="a", header=False, index=False)
+        else:
+            q_profile.to_csv(profile_path, index=False)
+    finally:
+        try:
+            if profile_path.exists():
+                os.chmod(profile_path, 0o777)
+        except Exception:
+            pass
     # Top 5 H-Bond stability table (by HBondCap)
     top5_hbond = res_df.sort_values("Around_N5_HBondCap", ascending=False).head(5)
     top5_hbond[["pdb_id", "Around_N5_HBondCap", "homo_lumo_gap"]].to_csv(
