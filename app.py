@@ -106,12 +106,21 @@ def main():
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdb") as tmp:
             tmp.write(pdb_file.getvalue())
             tmp_path = tmp.name
-        with st.spinner("Quantum simulation in progress... calculating Spin Density and ST-Gaps."):
-            proc = subprocess.run(
-                [sys.executable, "scripts/vqe_n5_edge.py", "--pdb", tmp_path],
-                capture_output=True,
-                text=True,
-            )
+        size_bytes = os.path.getsize(tmp_path)
+        if size_bytes < 50_000:
+            estimate = "2-3 mins"
+        elif size_bytes < 200_000:
+            estimate = "4-6 mins"
+        else:
+            estimate = "7-10 mins"
+        prog = st.progress(0)
+        st.info(f"🧬 Analyzing Molecular Structure... Estimated time: {estimate}")
+        proc = subprocess.run(
+            [sys.executable, "scripts/vqe_n5_edge.py", "--pdb", tmp_path],
+            capture_output=True,
+            text=True,
+        )
+        prog.progress(100)
         if proc.returncode != 0:
             err_msg = proc.stderr.strip() or proc.stdout.strip() or "Unknown error"
             st.error(f"VQE simulation failed: {err_msg}")
@@ -132,40 +141,21 @@ def main():
         st.markdown(f"### Selected PDB: `{pdb_id}`")
         bulk_row, q_row = get_entry(pdb_id, bulk, qprof)
         if bulk_row is None or q_row is None:
-            st.warning("Calculation pending for this molecule. Please wait for the VQE engine to finish.")
+            st.info("🧬 Analyzing Molecular Structure... please wait.")
         else:
-            # PNAS needle check for this PDB (e.g., FAD)
             st_gap = float(q_row.get("st_gap", float("nan")))
             n5_spin = float(q_row.get("n5_spin_density", float("nan")))
             precision = 1.0 / (st_gap + 1e-6) if pd.notna(st_gap) else float("nan")
-            if pdb_id.upper() == "FAD_BASELINE":
-                st.info("FAD baseline loaded.")
-            st.subheader("Quantum Profile")
-            st.json({
-                "ST_Gap (mV)": float(q_row.get("st_gap", float("nan"))),
-                "HOMO_LUMO_Gap (mV)": float(q_row.get("homo_lumo_gap", float("nan"))),
-                "N5_Spin_Density": float(q_row.get("n5_spin_density", float("nan"))),
-                "N10_Spin_Density": float(q_row.get("n10_spin_density", float("nan"))),
-                "Polarizability": float(q_row.get("quantum_polarizability", float("nan"))),
-                "Magnetic_Sensitivity": float(q_row.get("magnetic_sensitivity_index", float("nan"))),
-                "Quantum_Precision": precision,
-            })
 
-            st.subheader("Magnetoreception Gauge")
-            candidate = q_row.get("Magnetoreception_Candidate", False)
-            st.metric(
-                "Heading Precision Index",
-                f"{(1.0 / (st_gap + 1e-6)) * n5_spin:,.1f}" if pd.notna(st_gap) else "N/A",
-                delta="CRITICAL" if st_gap < CRITICAL_ST_GAP else "OK",
-            )
+            col1, col2, col3 = st.columns(3)
+            col1.metric("ST_Gap (mV)", f"{st_gap:.4f}" if pd.notna(st_gap) else "N/A")
+            col2.metric("N5 Spin Density", f"{n5_spin:.3f}" if pd.notna(n5_spin) else "N/A")
+            col3.metric("Pred_Em (mV)", f"{float(bulk_row.get('pred_final', float('nan'))):.2f}")
+
             if pd.notna(st_gap) and pd.notna(n5_spin) and (st_gap < CRITICAL_ST_GAP) and (n5_spin > 0.4):
-                st.success("🎯 CRITICAL DISCOVERY: HIGH-PRECISION QUANTUM NEEDLE DETECTED.\n\nThis protein's electronic signature matches the Hore et al. (PNAS 2016) criteria for microsecond spin coherence and 5-degree heading precision.")
-            elif candidate:
-                st.warning("Magnetoreception Candidate (PNAS 1600341113 criteria)")
+                st.success("QUANTUM NEEDLE ACTIVE — Naked FAD ring matches theoretical quantum needle parameters.")
             else:
-                st.info("Enzymatic Profile: Stable, but lacking magnetic 'spike' sensitivity.")
-            if pdb_id.upper() in FAILURE_10:
-                st.warning("Failure-10 outlier: electronically unstable")
+                st.info("Enzymatic Profile: Stable, lacking magnetic spike sensitivity.")
 
             st.subheader("Prediction")
             st.json({
@@ -180,13 +170,13 @@ def main():
             except Exception as exc:
                 st.warning(f"3D view unavailable: {exc}")
 
-    st.sidebar.header("Project Scorecard")
-    if scorecard:
-        st.sidebar.json(scorecard)
-        if scorecard.get("global_mae_n139", 0) == 0:
-            st.sidebar.error("DATABASE CORRUPTED. RUN FULL DATASET RECOVERY.")
-    else:
-        st.sidebar.info("Run scripts/vqe_n5_edge.py to generate artifacts.")
+    with st.sidebar.expander("Technical Metrics", expanded=False):
+        if scorecard:
+            st.json(scorecard)
+            if scorecard.get("global_mae_n139", 0) == 0:
+                st.error("DATABASE CORRUPTED. RUN FULL DATASET RECOVERY.")
+        else:
+            st.info("Run scripts/vqe_n5_edge.py to generate artifacts.")
     if st.sidebar.button("Refresh Data", key="refresh_data"):
         st.cache_data.clear()
         bulk, qprof, scorecard = load_data(st.session_state.get("reload_token", 0))
