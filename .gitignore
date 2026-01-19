@@ -1,57 +1,10 @@
-# Python
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-env/
-venv/
-ENV/
-.venv
-
-# Data files (too large for git)
-*.csv
-*.pdb
-*.sdf
-*.pdbqt
-data/
-models/*.pkl
-reports/*.html
-
-# Logs
-*.log
-redock.log
-batch_add_features.log
-
-# Temporary files
-*.tmp
-*.temp
-test_*/
-redock_*/
-*_tmp_*/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Jupyter
+*.pyc
 .ipynb_checkpoints/
-*.ipynb
+artifacts/
+catboost_info/
+.DS_Store
 
-# Model outputs
-predictions.csv
-all_features*.csv
-redock_report.csv
-
-# Keep directory structure but ignore contents
-!data/.gitkeep
-!models/.gitkeep
-!reports/.gitkeep
-
+# Local data outputs
+data/redox_dataset_preprocessed.csv
+data/redox_dataset_preprocessed.parquet

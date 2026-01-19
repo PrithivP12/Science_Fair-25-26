@@ -1,2 +1,0 @@
-"""Redox potential prediction package."""
-
