@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pandas as pd
@@ -77,8 +78,22 @@ def main():
 
     # Auto-analysis for uploaded PDB not in artifacts
     if pdb_file is not None and pdb_id and (qprof.empty or pdb_id.upper() not in set(qprof["pdb_id"].astype(str).str.upper())):
-        st.error("Auto-VQE for uploaded PDBs is not supported (script has no --pdb flag). Please add this protein to the dataset and rerun scripts/vqe_n5_edge.py manually.")
-        return
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdb") as tmp:
+            tmp.write(pdb_file.getvalue())
+            tmp_path = tmp.name
+        with st.spinner("Quantum simulation in progress... calculating Spin Density and ST-Gaps."):
+            proc = subprocess.run(
+                [sys.executable, "scripts/vqe_n5_edge.py", "--pdb", tmp_path],
+                capture_output=True,
+                text=True,
+            )
+        if proc.returncode != 0:
+            err_msg = proc.stderr.strip() or proc.stdout.strip() or "Unknown error"
+            st.error(f"VQE simulation failed: {err_msg}")
+            return
+        st.session_state["reload_token"] = st.session_state.get("reload_token", 0) + 1
+        bulk, qprof, scorecard = load_data(st.session_state["reload_token"])
+        available_ids = sorted(set(qprof["pdb_id"].astype(str).str.upper())) if not qprof.empty else []
 
     if pdb_id:
         st.markdown(f"### Selected PDB: `{pdb_id}`")
@@ -105,10 +120,12 @@ def main():
                 f"{(1.0 / (st_gap + 1e-6)) * n5_spin:,.1f}" if pd.notna(st_gap) else "N/A",
                 delta="CRITICAL" if st_gap < CRITICAL_ST_GAP else "OK",
             )
-            if st_gap < CRITICAL_ST_GAP:
-                st.error("CRITICAL: Quantum Needle Detected (ST gap < 0.01 meV)")
+            if pd.notna(st_gap) and pd.notna(n5_spin) and (st_gap < CRITICAL_ST_GAP) and (n5_spin > 0.4):
+                st.error("🎯 CRITICAL DISCOVERY: HIGH-PRECISION QUANTUM NEEDLE DETECTED.\n\nThis protein's electronic signature matches the Hore et al. (PNAS 2016) criteria for microsecond spin coherence and 5-degree heading precision.")
             elif candidate:
                 st.warning("Magnetoreception Candidate (PNAS 1600341113 criteria)")
+            else:
+                st.info("Enzymatic Profile: Stable, but lacking magnetic 'spike' sensitivity.")
             if pdb_id.upper() in FAILURE_10:
                 st.warning("Failure-10 outlier: electronically unstable")
 

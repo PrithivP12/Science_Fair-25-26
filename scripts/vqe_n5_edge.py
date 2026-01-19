@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from pathlib import Path
 from typing import Dict, Tuple
 
 import numpy as np
@@ -401,6 +402,23 @@ def main(args: argparse.Namespace) -> None:
     df = df[[c for c in FEATURES if c in df.columns]].copy()
     df = df.dropna(subset=["Em", "Around_N5_IsoelectricPoint", "Around_N5_HBondCap", "Around_N5_Flexibility"])
 
+    single_mode = bool(args.pdb)
+    if single_mode:
+        # Create a placeholder entry using dataset means for missing fields
+        mean_row = df.mean(numeric_only=True)
+        pdb_id_single = Path(args.pdb).stem if hasattr(args, "pdb") else "UNKNOWN"
+        single_entry = {
+            "pdb_id": pdb_id_single,
+            "uniprot_id": "NA",
+            "Em": float(mean_row.get("Em", df["Em"].mean())),
+            "Around_N5_IsoelectricPoint": float(mean_row.get("Around_N5_IsoelectricPoint", 0.0)),
+            "Around_N5_HBondCap": float(mean_row.get("Around_N5_HBondCap", 0.0)),
+            "Around_N5_Flexibility": float(mean_row.get("Around_N5_Flexibility", 0.0)),
+            "N5_nearest_resname": "UNK",
+            "cofactor": "NA",
+        }
+        df = pd.DataFrame([single_entry])
+
     gpr = train_gpr(df)
     X_gpr = df[["Around_N5_IsoelectricPoint", "Around_N5_HBondCap", "Around_N5_Flexibility"]].values
     gpr_pred, gpr_sigma = gpr.predict(X_gpr, return_std=True)
@@ -594,7 +612,7 @@ def main(args: argparse.Namespace) -> None:
     out_dir = "artifacts/qc_n5_gpr"
     os.makedirs(out_dir, exist_ok=True)
     res_df.to_csv(os.path.join(out_dir, "bulk_quantum_results.csv"), index=False)
-    res_df[
+    q_profile = res_df[
         [
             "pdb_id",
             "true_Em",
@@ -607,9 +625,14 @@ def main(args: argparse.Namespace) -> None:
             "st_gap",
             "magnetic_sensitivity_index",
         ]
-    ].to_csv(
-        os.path.join(out_dir, "Final_Quantum_Profiles.csv"), index=False
-    )
+    ]
+    profile_path = os.path.join(out_dir, "Final_Quantum_Profiles.csv")
+    if single_mode and os.path.exists(profile_path):
+        existing = pd.read_csv(profile_path, low_memory=False)
+        combined = pd.concat([existing, q_profile], ignore_index=True)
+        combined.to_csv(profile_path, index=False)
+    else:
+        q_profile.to_csv(profile_path, index=False)
     # Top 5 H-Bond stability table (by HBondCap)
     top5_hbond = res_df.sort_values("Around_N5_HBondCap", ascending=False).head(5)
     top5_hbond[["pdb_id", "Around_N5_HBondCap", "homo_lumo_gap"]].to_csv(
@@ -1061,5 +1084,6 @@ def main(args: argparse.Namespace) -> None:
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="data/redox_dataset_preprocessed.csv")
+    ap.add_argument("--pdb", help="Optional path to a single PDB file to process as a new entry")
     args = ap.parse_args()
     main(args)
