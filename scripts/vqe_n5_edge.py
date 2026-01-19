@@ -616,6 +616,14 @@ def main(args: argparse.Namespace) -> None:
         os.path.join(out_dir, "Top5_HBond_Stability.csv"), index=False
     )
 
+    # Coherence filter and heading precision
+    res_df["Coherence_Filter"] = res_df["st_gap"] < 0.01
+    res_df["Heading_Precision_Index"] = (1.0 / (res_df["st_gap"] + 1e-6)) * res_df["n5_spin_density"]
+    top10_heading = res_df.sort_values("Heading_Precision_Index", ascending=False).head(10)
+    top10_heading[["pdb_id", "Heading_Precision_Index", "st_gap", "n5_spin_density"]].to_csv(
+        os.path.join(out_dir, "PNAS_Validation_Table.csv"), index=False
+    )
+
     # Global MAE lock: if not improved, revert to GPR
     mae_initial = mean_absolute_error(res_df["true_Em"], res_df["pred_final"])
     lock_applied = False
