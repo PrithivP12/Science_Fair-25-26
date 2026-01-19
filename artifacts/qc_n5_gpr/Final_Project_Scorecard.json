@@ -4,5 +4,10 @@
   "clean_room_r2": 0.7866514506886799,
   "chemical_hits_lt43": 85,
   "clean_room_hit_pct_lt36": 59.2,
-  "clean_room_hit_pct_lt43": 67.2
+  "clean_room_hit_pct_lt43": 67.2,
+  "magnetic_candidates_failure10": 0,
+  "avg_st_gap_hits": 0.016367526458143922,
+  "avg_st_gap_miss": 0.013168191392646711,
+  "corr_residual_vs_st_gap": 0.03412688107689402,
+  "conclusion": "Failure 10 do not show strong magnetic signatures"
 }

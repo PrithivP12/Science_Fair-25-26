@@ -841,6 +841,17 @@ def main(args: argparse.Namespace) -> None:
     plt.savefig(os.path.join(out_dir, "clean_cumulative_error.png"), dpi=150)
     plt.close()
 
+    # Spin vs error analysis
+    plt.figure(figsize=(6, 5))
+    colors = ["gold" if x in failure_ids else "blue" for x in res_df["pdb_id"].astype(str).str.upper()]
+    plt.scatter(res_df["st_gap"], res_df["abs_err_gpr"], c=colors, alpha=0.7)
+    plt.xlabel("ST Gap (mV)")
+    plt.ylabel("GPR Error (mV)")
+    plt.title("Spin vs Error Analysis (Failures highlighted)")
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "Spin_vs_Error_Analysis.png"), dpi=150)
+    plt.close()
+
     # If MAE > 46 mV, revert failure 10 to pure GPR and recompute metrics
     if mae_final > 46.0 and failure_mask.any():
         res_df.loc[failure_mask, "pred_final"] = res_df.loc[failure_mask, "gpr_pred"]
@@ -906,6 +917,32 @@ def main(args: argparse.Namespace) -> None:
     with open(os.path.join(out_dir, "applicability_domain_summary.json"), "w", encoding="utf-8") as f:
         json.dump(applicability_summary, f, indent=2)
 
+    # Magnetic signature analysis
+    qprof_path = os.path.join(out_dir, "Final_Quantum_Profiles.csv")
+    qprof = pd.read_csv(qprof_path)
+    st_thresh = qprof["st_gap"].quantile(0.1) if "st_gap" in qprof else float("nan")
+    spin_thresh_n5 = qprof["n5_spin_density"].quantile(0.9) if "n5_spin_density" in qprof else float("nan")
+    spin_thresh_n10 = qprof["n10_spin_density"].quantile(0.9) if "n10_spin_density" in qprof else float("nan")
+    qprof["Magnetoreception_Candidate"] = (
+        (qprof["st_gap"] <= st_thresh)
+        & (qprof["n5_spin_density"] >= spin_thresh_n5)
+        & (qprof["n10_spin_density"] >= spin_thresh_n10)
+    )
+    qprof.to_csv(qprof_path, index=False)
+
+    res_df = res_df.merge(qprof[["pdb_id", "Magnetoreception_Candidate"]], on="pdb_id", how="left")
+    res_df["Magnetoreception_Candidate"] = res_df["Magnetoreception_Candidate"].fillna(False)
+
+    # Residual vs ST_Gap correlation
+    res_with_gap = res_df.dropna(subset=["st_gap"])
+    corr_resid_gap = float("nan")
+    if not res_with_gap.empty and res_with_gap["st_gap"].std(ddof=0) > 0:
+        corr_resid_gap = np.corrcoef(res_with_gap["true_Em"] - res_with_gap["gpr_pred"], res_with_gap["st_gap"])[0, 1]
+
+    failure_candidates = res_df[res_df["pdb_id"].astype(str).str.upper().isin(failure_ids) & res_df["Magnetoreception_Candidate"]]
+    avg_st_gap_hits = float(res_df[res_df["abs_err_final"] < CHEM_ACCURACY]["st_gap"].mean())
+    avg_st_gap_miss = float(res_df[res_df["abs_err_final"] >= CHEM_ACCURACY]["st_gap"].mean())
+
     final_scorecard = {
         "global_mae_n139": mae_final,
         "clean_room_mae_n129": clean_mae,
@@ -913,6 +950,11 @@ def main(args: argparse.Namespace) -> None:
         "chemical_hits_lt43": chemical_hits_43,
         "clean_room_hit_pct_lt36": clean_hit_pct_36,
         "clean_room_hit_pct_lt43": clean_hit_pct_43,
+        "magnetic_candidates_failure10": int(len(failure_candidates)),
+        "avg_st_gap_hits": avg_st_gap_hits,
+        "avg_st_gap_miss": avg_st_gap_miss,
+        "corr_residual_vs_st_gap": corr_resid_gap,
+        "conclusion": "Failure 10 show magnetic-like signatures" if len(failure_candidates) > 0 else "Failure 10 do not show strong magnetic signatures",
     }
     with open(os.path.join(out_dir, "Final_Project_Scorecard.json"), "w", encoding="utf-8") as f:
         json.dump(final_scorecard, f, indent=2)
