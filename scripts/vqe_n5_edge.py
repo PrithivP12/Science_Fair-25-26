@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Quantum-Feature Augmentation: use GPR as primary and apply a damped quantum nudge.
+Quantum-Feature Augmentation with Escalation Engine: use GPR as primary, apply damped quantum nudges, and escalate to 8Q when necessary.
 """
 from __future__ import annotations
 
@@ -25,6 +25,10 @@ TARGET_BENCHMARK = 36.0
 COMPLEXITY_SPECIALIST = 1.2  # unused in augmentation, retained for reference
 SIGMA_SPECIALIST = 80.0       # unused in augmentation, retained for reference
 QUANTUM_SCALE = 1.0
+NUDGE_FACTOR_4Q = 0.08
+NUDGE_FACTOR_8Q = 0.25
+ESCALATE_COMPLEXITY = 1.8
+ESCALATE_SIGMA = 90.0
 
 FEATURES = [
     "Around_N5_IsoelectricPoint",
@@ -78,6 +82,58 @@ def build_hamiltonian_4q(eps_n5: float, f_val: float, g_hb: float, h_hop: float,
     return H
 
 
+def build_hamiltonian_8q(
+    eps_n5: float,
+    eps_c4a: float,
+    g_hb: float,
+    g_c4a: float,
+    h_hop: float,
+    cross_scale_n5_c4a: float,
+    flex: float,
+) -> np.ndarray:
+    # Qubits 0-3: N5 block; 4-7: C4a/N1 block
+    I, X, Y, Z = pauli_mats()
+
+    def kron_on(qubit: int, op):
+        ops = []
+        for i in range(8):
+            ops.append(op if i == qubit else I)
+        out = ops[0]
+        for op_i in ops[1:]:
+            out = np.kron(out, op_i)
+        return out
+
+    # Local Z terms
+    H = np.zeros((256, 256), dtype=complex)
+    for q in range(4):
+        H += eps_n5 * kron_on(q, Z)
+    for q in range(4, 8):
+        H += eps_c4a * kron_on(q, Z)
+
+    # Pairwise ZZ within each block
+    for q1 in range(4):
+        for q2 in range(q1 + 1, 4):
+            H += g_hb * kron_on(q1, Z) @ kron_on(q2, Z)
+    for q1 in range(4, 8):
+        for q2 in range(q1 + 1, 8):
+            H += g_c4a * kron_on(q1, Z) @ kron_on(q2, Z)
+
+    # Hopping within blocks (nearest neighbor)
+    def add_hop(q1, q2, scale):
+        H_local = scale * (kron_on(q1, X) @ kron_on(q2, X) + kron_on(q1, Y) @ kron_on(q2, Y))
+        return H_local
+
+    for q in range(3):
+        H += add_hop(q, q + 1, h_hop)
+    for q in range(4, 7):
+        H += add_hop(q, q + 1, h_hop * 0.8)
+
+    # Cross block coupling (bridge N5-C4a)
+    H += cross_scale_n5_c4a * flex * (kron_on(3, X) @ kron_on(4, X) + kron_on(3, Y) @ kron_on(4, Y))
+
+    return H
+
+
 def exact_ground(H: np.ndarray) -> float:
     w, _ = np.linalg.eigh(H)
     return float(np.real(np.min(w)))
@@ -99,7 +155,7 @@ def interpolate_params(iso: float, flex: float, hb: float, fam: str) -> Dict[str
     return {"iso_scale": iso_scale, "hb_scale": hb_scale, "cross_scale": cross_scale}
 
 
-def predict_energy(row, params: Dict[str, float], mv_to_au: float, gpr_baseline: float, fam: str = "other") -> float:
+def predict_energy_4q(row, params: Dict[str, float], mv_to_au: float, gpr_baseline: float, fam: str = "other") -> float:
     iso = float(row["Around_N5_IsoelectricPoint"])
     hb = float(row["Around_N5_HBondCap"])
     flex = float(row["Around_N5_Flexibility"])
@@ -114,6 +170,25 @@ def predict_energy(row, params: Dict[str, float], mv_to_au: float, gpr_baseline:
     cross_scale = params["cross_scale"]
 
     H = build_hamiltonian_4q(eps_n5, f_val, g_hb, H_HOP, flex, cross_scale)
+    energy_au = exact_ground(H)
+    return energy_au / mv_to_au if mv_to_au != 0 else np.nan
+
+
+def predict_energy_8q(row, params: Dict[str, float], mv_to_au: float, gpr_baseline: float) -> float:
+    iso = float(row["Around_N5_IsoelectricPoint"])
+    hb = float(row["Around_N5_HBondCap"])
+    flex = float(row["Around_N5_Flexibility"])
+    c4a_pol = float(row.get("Around_C4a_Polarity", hb))  # proxy if missing
+
+    eps_n5 = params["iso_scale"] * iso + mv_to_au * gpr_baseline
+    eps_n5 *= 1.0 / (1.0 + abs(flex))
+    eps_c4a = 0.8 * eps_n5 + 0.05 * c4a_pol
+
+    g_hb = params["hb_scale"] * hb
+    g_c4a = 0.8 * params["hb_scale"] * c4a_pol
+    cross_scale = params["cross_scale"]
+
+    H = build_hamiltonian_8q(eps_n5, eps_c4a, g_hb, g_c4a, H_HOP, cross_scale, flex)
     energy_au = exact_ground(H)
     return energy_au / mv_to_au if mv_to_au != 0 else np.nan
 
@@ -191,13 +266,16 @@ def main(args: argparse.Namespace) -> None:
             pred_gpr = pred_gpr_raw
 
         # pure quantum prediction (no offsets/caps)
-        pred_4q = predict_energy(row, params, MV_TO_AU, gpr_baseline=pred_gpr_raw, fam=fam) * QUANTUM_SCALE
+        pred_4q_raw = predict_energy_4q(row, params, MV_TO_AU, gpr_baseline=pred_gpr_raw, fam=fam) * QUANTUM_SCALE
 
         # complexity
         z_iso = (iso_val - iso_mean) / iso_std if iso_std > 0 else 0.0
         z_hb = (hb_val - hb_mean) / hb_std if hb_std > 0 else 0.0
         complexity = abs(z_iso) + abs(z_hb) + 0.5 * abs(flex_val)
         damping = 1.0 / (1.0 + complexity)
+
+        # Escalation trigger
+        escalate = (complexity > ESCALATE_COMPLEXITY) or (row["gpr_sigma"] > ESCALATE_SIGMA)
 
         # Goldilocks weighting: within 0.5 SD of success means -> w_q=0.5 else 0.05
         def within(mu, sd, val):
@@ -208,25 +286,31 @@ def main(args: argparse.Namespace) -> None:
             and within(success_means["hb"], success_stds["hb"], hb_val)
             and within(success_means["sigma"], success_stds["sigma"], row["gpr_sigma"])
         )
-        w_q = 0.5 if in_domain else 0.05
+        base_w_q = 0.5 if in_domain else 0.05
 
         # Only allow quantum influence when sigma is above median; otherwise fall back to 100% GPR
         if row["gpr_sigma"] <= sigma_median:
-            w_q = 0.0
+            base_w_q = 0.0
 
-        # Apply blend with damping on delta magnitude (as a soft shield)
-        quantum_delta = pred_4q - pred_gpr
-        nudge = w_q * quantum_delta * damping
-        # cap nudge to +/-15 mV to avoid spikes
+        # Choose Hamiltonian mode
+        if escalate:
+            pred_q = predict_energy_8q(row, params, MV_TO_AU, gpr_baseline=pred_gpr_raw) * QUANTUM_SCALE
+            nudge_factor = NUDGE_FACTOR_8Q
+            used_model = "hybrid_8q"
+        else:
+            pred_q = pred_4q_raw
+            nudge_factor = NUDGE_FACTOR_4Q
+            used_model = "hybrid_4q" if base_w_q > 0 else "gpr"
+
+        quantum_delta = pred_q - pred_gpr
+        nudge = base_w_q * nudge_factor / NUDGE_FACTOR_4Q * quantum_delta * damping
         nudge = float(np.clip(nudge, -15.0, 15.0))
         candidate = pred_gpr + nudge
-        # discard nudge if it moves away from global mean
         if abs(candidate - gpr_mean) > abs(pred_gpr - gpr_mean):
             nudge = 0.0
             pred_final = pred_gpr
         else:
             pred_final = candidate
-        used_model = "hybrid" if w_q > 0 else "gpr"
 
         records.append(
             {
@@ -238,12 +322,13 @@ def main(args: argparse.Namespace) -> None:
                 "gpr_pred": float(pred_gpr),
                 "gpr_pred_raw": float(pred_gpr_raw),
                 "gpr_sigma": float(row["gpr_sigma"]),
-                "pred_4q": float(pred_4q),
+                "pred_4q": float(pred_4q_raw),
+                "pred_q_used": float(pred_q),
                 "pred_final": float(pred_final),
                 "quantum_delta": float(quantum_delta),
                 "nudge": float(nudge),
                 "abs_err_gpr": abs(row["Em"] - pred_gpr),
-                "abs_err_4q": abs(row["Em"] - pred_4q),
+                "abs_err_4q": abs(row["Em"] - pred_4q_raw),
                 "abs_err_final": abs(row["Em"] - pred_final),
                 "complexity_score": complexity,
                 "used_model": used_model,
@@ -308,7 +393,7 @@ def main(args: argparse.Namespace) -> None:
 
     # Quantum vs Classical divergence map for failures
     divergence = failure_top.copy()
-    divergence["raw_delta_mag"] = (divergence["pred_4q"] - divergence["gpr_pred_raw"]).abs()
+    divergence["raw_delta_mag"] = (divergence["pred_q_used"] - divergence["gpr_pred_raw"]).abs()
     divergence_major = divergence[divergence["raw_delta_mag"] > 150.0]
     divergence_major.to_csv(os.path.join(out_dir, "divergence_major_gt150.csv"), index=False)
 
@@ -399,6 +484,11 @@ def main(args: argparse.Namespace) -> None:
         "success_stds_gpr_based": success_stds,
     }
 
+    failure_ids = ["1CF3", "1IJH", "4MJW", "1UMK", "1NG4", "1VAO", "2GMJ", "1E0Y", "5K9B", "1HUV"]
+    failure_mask = res_df["pdb_id"].astype(str).isin(failure_ids)
+    failure_mae_4q = float(mean_absolute_error(res_df.loc[failure_mask, "true_Em"], res_df.loc[failure_mask, "pred_4q"])) if failure_mask.any() else float("nan")
+    failure_mae_escalated = float(mean_absolute_error(res_df.loc[failure_mask, "true_Em"], res_df.loc[failure_mask, "pred_final"])) if failure_mask.any() else float("nan")
+
     summary = {
         "global_mae": {"gpr": mae_gpr, "hybrid": mae_final},
         "global_medae": medae_final,
@@ -411,6 +501,8 @@ def main(args: argparse.Namespace) -> None:
         "feature_contrast_file": "feature_contrast_success_vs_failure.csv",
         "failure_cases_file": "failure_cases_gt80.csv",
         "divergence_major_file": "divergence_major_gt150.csv",
+        "failure_mae_4q_baseline": failure_mae_4q,
+        "failure_mae_escalated": failure_mae_escalated,
     }
     with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
