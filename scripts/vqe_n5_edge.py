@@ -621,7 +621,8 @@ def main(args: argparse.Namespace) -> None:
     res_df = pd.DataFrame(records)
     out_dir = "artifacts/qc_n5_gpr"
     os.makedirs(out_dir, exist_ok=True)
-    res_df.to_csv(os.path.join(out_dir, "bulk_quantum_results.csv"), index=False)
+    bulk_path = Path(out_dir) / "bulk_quantum_results.csv"
+    profile_path = Path(out_dir) / "Final_Quantum_Profiles.csv"
     q_profile = res_df[
         [
             "pdb_id",
@@ -636,17 +637,25 @@ def main(args: argparse.Namespace) -> None:
             "magnetic_sensitivity_index",
         ]
     ]
-    profile_path = Path(out_dir) / "Final_Quantum_Profiles.csv"
-    csv_path = Path("artifacts") / "Final_Quantum_Profiles.csv"
-    try:
-        if single_mode and csv_path.exists():
-            q_profile.to_csv(csv_path, mode="a", header=False, index=False)
+    if single_mode:
+        if bulk_path.exists():
+            res_df.to_csv(bulk_path, mode="a", header=False, index=False)
         else:
-            q_profile.to_csv(csv_path, index=False)
-    finally:
+            res_df.to_csv(bulk_path, index=False)
+        if profile_path.exists():
+            q_profile.to_csv(profile_path, mode="a", header=False, index=False)
+        else:
+            q_profile.to_csv(profile_path, index=False)
         try:
-            if csv_path.exists():
-                os.chmod(csv_path, 0o777)
+            os.chmod(profile_path, 0o777)
+            os.chmod(bulk_path, 0o777)
+        except Exception:
+            pass
+    else:
+        res_df.to_csv(bulk_path, index=False)
+        try:
+            q_profile.to_csv(profile_path, index=False)
+            os.chmod(profile_path, 0o777)
         except Exception:
             pass
     # Top 5 H-Bond stability table (by HBondCap)
@@ -1094,8 +1103,9 @@ def main(args: argparse.Namespace) -> None:
         f.write("\n".join(conclusion_lines))
 
     if single_mode:
-        print(f"SUCCESS: Saved {pdb_id_single} to {csv_path.resolve()}")
+        print(f"SUCCESS: Saved {pdb_id_single} to {profile_path.resolve()}")
         print("VQE_COMPLETE")
+        return
 
     print(json.dumps(summary, indent=2))
     print("Final MAE:", mae_final)

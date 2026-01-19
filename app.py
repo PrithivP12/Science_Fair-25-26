@@ -111,6 +111,8 @@ def main():
                 break
             time.sleep(2)
 
+    if not pdb_input and "FAD" in available_ids:
+        pdb_id = "FAD"
     if pdb_id:
         st.markdown(f"### Selected PDB: `{pdb_id}`")
         bulk_row, q_row = get_entry(pdb_id, bulk, qprof)
