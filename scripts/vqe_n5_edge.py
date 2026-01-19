@@ -610,6 +610,11 @@ def main(args: argparse.Namespace) -> None:
     ].to_csv(
         os.path.join(out_dir, "Final_Quantum_Profiles.csv"), index=False
     )
+    # Top 5 H-Bond stability table (by HBondCap)
+    top5_hbond = res_df.sort_values("Around_N5_HBondCap", ascending=False).head(5)
+    top5_hbond[["pdb_id", "Around_N5_HBondCap", "homo_lumo_gap"]].to_csv(
+        os.path.join(out_dir, "Top5_HBond_Stability.csv"), index=False
+    )
 
     # Global MAE lock: if not improved, revert to GPR
     mae_initial = mean_absolute_error(res_df["true_Em"], res_df["pred_final"])
