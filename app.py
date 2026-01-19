@@ -64,7 +64,7 @@ def main():
         available_ids = []
     else:
         col = "PDB_ID" if "PDB_ID" in qprof else "pdb_id"
-        available_ids = sorted(set(qprof[col].astype(str).str.upper()))
+    available_ids = sorted(set(qprof[col].astype(str).str.upper()))
     default_id = available_ids[0] if available_ids else ""
 
     pdb_input = st.text_input("Enter PDB ID (e.g., 1CF3):", value=default_id).strip()
@@ -123,6 +123,8 @@ def main():
             st_gap = float(q_row.get("st_gap", float("nan")))
             n5_spin = float(q_row.get("n5_spin_density", float("nan")))
             precision = 1.0 / (st_gap + 1e-6) if pd.notna(st_gap) else float("nan")
+            if pdb_id.upper() == "FAD_BASELINE":
+                st.info("FAD baseline loaded.")
             st.subheader("Quantum Profile")
             st.json({
                 "ST_Gap (mV)": float(q_row.get("st_gap", float("nan"))),

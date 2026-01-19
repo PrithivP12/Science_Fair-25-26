@@ -414,15 +414,14 @@ def main(args: argparse.Namespace) -> None:
 
     single_mode = bool(args.pdb)
     if single_mode:
-        # Create a placeholder entry using dataset means for missing fields
         mean_row = df.mean(numeric_only=True)
-        pdb_id_single = Path(args.pdb).stem.upper() if hasattr(args, "pdb") else "UNKNOWN"
+        pdb_id_single = "FAD_BASELINE"
         single_entry = {
             "pdb_id": pdb_id_single,
             "uniprot_id": "NA",
             "Em": float(mean_row.get("Em", df["Em"].mean())),
             "Around_N5_IsoelectricPoint": float(mean_row.get("Around_N5_IsoelectricPoint", 0.0)),
-            "Around_N5_HBondCap": float(mean_row.get("Around_N5_HBondCap", 0.0)),
+            "Around_N5_HBondCap": 0.0,
             "Around_N5_Flexibility": float(mean_row.get("Around_N5_Flexibility", 0.0)),
             "N5_nearest_resname": "UNK",
             "cofactor": "NA",
@@ -638,14 +637,15 @@ def main(args: argparse.Namespace) -> None:
         ]
     ]
     if single_mode:
+        # safe append: load existing and concat
         if bulk_path.exists():
-            res_df.to_csv(bulk_path, mode="a", header=False, index=False)
-        else:
-            res_df.to_csv(bulk_path, index=False)
+            existing_bulk = pd.read_csv(bulk_path)
+            res_df = pd.concat([existing_bulk, res_df], ignore_index=True)
+        res_df.to_csv(bulk_path, index=False)
         if profile_path.exists():
-            q_profile.to_csv(profile_path, mode="a", header=False, index=False)
-        else:
-            q_profile.to_csv(profile_path, index=False)
+            existing_prof = pd.read_csv(profile_path)
+            q_profile = pd.concat([existing_prof, q_profile], ignore_index=True)
+        q_profile.to_csv(profile_path, index=False)
         try:
             os.chmod(profile_path, 0o777)
             os.chmod(bulk_path, 0o777)
