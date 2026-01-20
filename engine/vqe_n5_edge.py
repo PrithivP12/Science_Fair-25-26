@@ -527,9 +527,26 @@ def cluster_labels(df: pd.DataFrame) -> Tuple[np.ndarray, Dict[int, str]]:
     return fam_labels, cluster_map
 
 
+def load_dataset(path: str) -> Tuple[pd.DataFrame, str]:
+    """Load the dataset, falling back to the bundled CSV if the requested file is missing."""
+    candidates = [path]
+    fallback = "data/redox_dataset.csv"
+    if fallback not in candidates:
+        candidates.append(fallback)
+
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return pd.read_csv(candidate, low_memory=False), candidate
+
+    tried = ", ".join(candidates)
+    raise FileNotFoundError(f"Dataset not found. Tried: {tried}. Pass --data with a valid CSV path.")
+
+
 def main(args: argparse.Namespace) -> None:
     global electro_factor_mut, vib_factor_mut, perturb_a426c
-    df = pd.read_csv(args.data, low_memory=False)
+    df, data_path_used = load_dataset(args.data)
+    if data_path_used != args.data:
+        print(f"INFO: dataset not found at {args.data}; using {data_path_used}")
     df = df[[c for c in FEATURES if c in df.columns]].copy()
     df = df.dropna(subset=["Em", "Around_N5_IsoelectricPoint", "Around_N5_HBondCap", "Around_N5_Flexibility"])
 
@@ -1324,7 +1341,7 @@ def main(args: argparse.Namespace) -> None:
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", default="data/redox_dataset_preprocessed.csv")
+    ap.add_argument("--data", default="data/redox_dataset.csv")
     ap.add_argument("--pdb", help="Optional path to a single PDB file to process as a new entry")
     args = ap.parse_args()
     main(args)
