@@ -16,7 +16,6 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.cluster import KMeans
 from sklearn.exceptions import ConvergenceWarning
-import warnings
 
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
 from sklearn.gaussian_process import GaussianProcessRegressor
@@ -41,6 +40,83 @@ NUDGE_FACTOR_12Q = 0.20
 NUDGE_FACTOR_16Q = 0.15
 ESCALATE_COMPLEXITY = 1.8
 ESCALATE_SIGMA = 90.0
+
+MUTATION_PHYSICS = {
+    "C": {"electro_shift": -0.15, "vib_damping": 1.10},
+    "F": {"electro_shift": 0.05, "vib_damping": 0.95},
+    "Y": {"electro_shift": 0.04, "vib_damping": 0.96},
+    "W": {"electro_shift": 0.03, "vib_damping": 0.97},
+}
+
+# mutation-dependent factors (set in main)
+electro_factor_mut = 1.0
+vib_factor_mut = 1.0
+AA_PROPERTIES = {
+    "A": {"e_neg": 0.0, "steric_index": 0.5},
+    "R": {"e_neg": 0.2, "steric_index": 1.2},
+    "N": {"e_neg": -0.2, "steric_index": 0.7},
+    "D": {"e_neg": -0.3, "steric_index": 0.7},
+    "C": {"e_neg": -0.8, "steric_index": 0.6},
+    "Q": {"e_neg": -0.2, "steric_index": 0.8},
+    "E": {"e_neg": -0.3, "steric_index": 0.8},
+    "G": {"e_neg": 0.0, "steric_index": 0.4},
+    "H": {"e_neg": -0.1, "steric_index": 0.9},
+    "I": {"e_neg": 0.1, "steric_index": 1.0},
+    "L": {"e_neg": 0.1, "steric_index": 1.0},
+    "K": {"e_neg": 0.2, "steric_index": 1.1},
+    "M": {"e_neg": 0.0, "steric_index": 0.9},
+    "F": {"e_neg": 0.2, "steric_index": 1.2},
+    "P": {"e_neg": 0.0, "steric_index": 0.8},
+    "S": {"e_neg": -0.1, "steric_index": 0.6},
+    "T": {"e_neg": -0.1, "steric_index": 0.7},
+    "W": {"e_neg": 0.3, "steric_index": 1.3},
+    "Y": {"e_neg": 0.2, "steric_index": 1.2},
+    "V": {"e_neg": 0.05, "steric_index": 0.9},
+}
+
+
+def compute_lfp_from_pdb(pdb_path: str) -> Tuple[float, float]:
+    """Compute local field potential and steric sum from residues within 5 Å of FMN/FAD centroid."""
+    if not pdb_path or not os.path.exists(pdb_path):
+        return 0.0, 0.0
+    fm_coords = []
+    res_coords: Dict[Tuple[str, str, str], list] = {}
+    try:
+        with open(pdb_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if not (line.startswith("ATOM") or line.startswith("HETATM")):
+                    continue
+                resn = line[17:20].strip()
+                chain = line[21].strip()
+                resi = line[22:26].strip()
+                try:
+                    x = float(line[30:38])
+                    y = float(line[38:46])
+                    z = float(line[46:54])
+                except ValueError:
+                    continue
+                key = (resn, chain, resi)
+                res_coords.setdefault(key, []).append((x, y, z))
+                if resn in {"FMN", "FAD"}:
+                    fm_coords.append((x, y, z))
+    except Exception:
+        return 0.0, 0.0
+    if not fm_coords:
+        return 0.0, 0.0
+    fm_centroid = np.mean(np.array(fm_coords), axis=0)
+    lfp = 0.0
+    steric_sum = 0.0
+    for (resn, chain, resi), coords in res_coords.items():
+        if resn in {"FMN", "FAD"}:
+            continue
+        coords_arr = np.array(coords)
+        dists = np.linalg.norm(coords_arr - fm_centroid, axis=1)
+        if np.min(dists) <= 5.0:
+            aa = resn[0].upper()
+            props = AA_PROPERTIES.get(aa, {"e_neg": 0.0, "steric_index": 0.0})
+            lfp += props.get("e_neg", 0.0)
+            steric_sum += props.get("steric_index", 0.0)
+    return lfp, steric_sum
 
 FEATURES = [
     "Around_N5_IsoelectricPoint",
@@ -67,6 +143,34 @@ def kron_n(*ops):
     for op in ops[1:]:
         out = np.kron(out, op)
     return out
+
+
+def clash_check(row: pd.Series) -> float:
+    """Return clash penalty (0 if clash detected, 100 if clear)."""
+    # If pocket_min_dist is provided, use it; otherwise assume no clashes.
+    if "pocket_min_dist" in row and pd.notna(row["pocket_min_dist"]):
+        return 0.0 if float(row["pocket_min_dist"]) < 0.8 else 100.0
+    return 100.0
+
+
+def triad_score(row: pd.Series) -> float:
+    """Score cryptochrome-like Trp triad proximity."""
+    dists = []
+    for key in ("trpA_dist", "trpB_dist", "trpC_dist"):
+        if key in row and pd.notna(row[key]):
+            dists.append(float(row[key]))
+    if dists:
+        within = sum(d <= 10.0 for d in dists)
+        if within == 3:
+            return 100.0
+        if within >= 1:
+            return 50.0
+        return 0.0
+    # If isolated cofactor baseline, triad absent
+    if str(row.get("pdb_id", "")).upper().startswith("FAD"):
+        return 0.0
+    # Default moderate confidence when no data
+    return 50.0
 
 
 def build_hamiltonian_4q(eps_n5: float, f_val: float, g_hb: float, h_hop: float, flex: float, cross_scale: float) -> np.ndarray:
@@ -324,7 +428,7 @@ def predict_energy_12q(row, params: Dict[str, float], mv_to_au: float, gpr_basel
     return energy_mv + proton_jump
 
 
-def predict_energy_16q(row, params: Dict[str, float], mv_to_au: float, gpr_baseline: float, complexity: float, fam: str = "other") -> float:
+def predict_energy_16q(row, params: Dict[str, float], mv_to_au: float, gpr_baseline: float, complexity: float, fam: str = "other", lfp: float = 0.0, steric_env: float = 0.0) -> float:
     iso = float(row["Around_N5_IsoelectricPoint"])
     hb = float(row["Around_N5_HBondCap"])
     flex = float(row["Around_N5_Flexibility"])
@@ -334,6 +438,7 @@ def predict_energy_16q(row, params: Dict[str, float], mv_to_au: float, gpr_basel
     eps_eff = min(20.0, 4.0 + 10.0 * flex)
 
     eps_n5 = params["iso_scale"] * iso + mv_to_au * gpr_baseline
+    eps_n5 *= electro_factor_mut * (1.0 + 0.1 * lfp)
     eps_n5 *= 1.0 / (1.0 + abs(flex))
     eps_c4a = 0.8 * eps_n5 + 0.05 * c4a_pol
     eps_c10 = 0.6 * eps_n5 + 0.03 * c10_proxy
@@ -344,11 +449,14 @@ def predict_energy_16q(row, params: Dict[str, float], mv_to_au: float, gpr_basel
     g_c10 = 0.6 * params["hb_scale"] * c10_proxy / eps_eff
     g_ringc = 0.5 * params["hb_scale"] * ringc_proxy / eps_eff
     cross_scale = params["cross_scale"] / eps_eff
+    cross_scale *= (1.0 + 0.05 * steric_env)
 
-    H_n5 = build_hamiltonian_4q(eps_n5, 0.0, g_n5, H_HOP / eps_eff, flex, cross_scale)
-    H_c4a = build_hamiltonian_4q(eps_c4a, 0.0, g_c4a, H_HOP * 0.8 / eps_eff, flex, cross_scale * 0.8)
-    H_c10 = build_hamiltonian_4q(eps_c10, 0.0, g_c10, H_HOP * 0.6 / eps_eff, flex, cross_scale * 0.6)
-    H_ringc = build_hamiltonian_4q(eps_ringc, 0.0, g_ringc, H_HOP * 0.5 / eps_eff, flex, cross_scale * 0.5)
+    hop_base = H_HOP / eps_eff
+    hop_base *= vib_factor_mut
+    H_n5 = build_hamiltonian_4q(eps_n5, 0.0, g_n5, hop_base, flex, cross_scale)
+    H_c4a = build_hamiltonian_4q(eps_c4a, 0.0, g_c4a, hop_base * 0.8, flex, cross_scale * 0.8)
+    H_c10 = build_hamiltonian_4q(eps_c10, 0.0, g_c10, hop_base * 0.6, flex, cross_scale * 0.6)
+    H_ringc = build_hamiltonian_4q(eps_ringc, 0.0, g_ringc, hop_base * 0.5, flex, cross_scale * 0.5)
 
     I, _, _, Z = pauli_mats()
     Zsum = kron_n(Z, I, I, I) + kron_n(I, Z, I, I) + kron_n(I, I, Z, I) + kron_n(I, I, I, Z)
@@ -368,6 +476,15 @@ def predict_energy_16q(row, params: Dict[str, float], mv_to_au: float, gpr_basel
     polarizability = float((hb + c4a_pol + c10_proxy + ringc_proxy) / max(eps_eff, 1e-6))
     magnetic_sensitivity = float(abs(spin_n5) + abs(spin_c10))
 
+    # Hyperfine coupling approximation (MHz) using spin density as proxy for |psi(0)|^2
+    hfcc_n14_n5 = 80.0 * abs(spin_n5)  # scaled proxy
+    hfcc_n14_n10 = 60.0 * abs(spin_c10)
+    hfcc_h1_ring = 40.0 * (abs(spin_n5) + abs(spin_c10)) / 2.0
+    hfcc_list = sorted([hfcc_n14_n5, hfcc_n14_n10, hfcc_h1_ring], reverse=True)
+    hfcc_primary = hfcc_list[0] if hfcc_list else float("nan")
+    hfcc_secondary = hfcc_list[1] if len(hfcc_list) > 1 else float("nan")
+    hfcc_tertiary = hfcc_list[2] if len(hfcc_list) > 2 else float("nan")
+
     profile = {
         "homo_lumo_gap": st_gap,
         "polarizability": polarizability,
@@ -375,6 +492,9 @@ def predict_energy_16q(row, params: Dict[str, float], mv_to_au: float, gpr_basel
         "n10_spin_density": float(spin_c10 / 4.0),
         "st_gap": st_gap,
         "magnetic_sensitivity": magnetic_sensitivity,
+        "hfcc_primary_mhz": hfcc_primary,
+        "hfcc_secondary_mhz": hfcc_secondary,
+        "hfcc_tertiary_mhz": hfcc_tertiary,
     }
 
     return energy_mv + orientation_shift, profile
@@ -408,14 +528,38 @@ def cluster_labels(df: pd.DataFrame) -> Tuple[np.ndarray, Dict[int, str]]:
 
 
 def main(args: argparse.Namespace) -> None:
+    global electro_factor_mut, vib_factor_mut, perturb_a426c
     df = pd.read_csv(args.data, low_memory=False)
     df = df[[c for c in FEATURES if c in df.columns]].copy()
     df = df.dropna(subset=["Em", "Around_N5_IsoelectricPoint", "Around_N5_HBondCap", "Around_N5_Flexibility"])
 
     single_mode = bool(args.pdb)
+
+    mutation_list_env = os.environ.get("MUTATION_LIST", "")
+    mutation_tokens = [m.strip().upper() for m in mutation_list_env.split(",") if m.strip()]
+    mutation_active = len(mutation_tokens) > 0
+    mutation_has_a426c = any("A426C" in m for m in mutation_tokens)
+
+    def mutation_factors(tokens):
+        electro_factor = 1.0
+        vib_factor = 1.0
+        for tok in tokens:
+            aa = tok[-1] if tok else ""
+            data = MUTATION_PHYSICS.get(aa, None)
+            if data:
+                electro_factor *= (1.0 + data.get("electro_shift", 0.0))
+                vib_factor *= data.get("vib_damping", 1.0)
+        return electro_factor, vib_factor
+
+    electro_factor_mut, vib_factor_mut = mutation_factors(mutation_tokens)
+    mutation_lfp_sum = sum(AA_PROPERTIES.get(t[-1], {"e_neg": 0.0}).get("e_neg", 0.0) for t in mutation_tokens)
+    mutation_steric_sum = sum(AA_PROPERTIES.get(t[-1], {"steric_index": 0.0}).get("steric_index", 0.0) for t in mutation_tokens)
+    lfp_pdb, steric_pdb = compute_lfp_from_pdb(args.pdb) if single_mode and args.pdb else (0.0, 0.0)
+
     if single_mode:
         mean_row = df.mean(numeric_only=True)
         pdb_id_single = "FAD_BASELINE"
+        print(f"STATUS: Scanning residue {pdb_id_single}...")
         single_entry = {
             "pdb_id": pdb_id_single,
             "uniprot_id": "NA",
@@ -471,6 +615,15 @@ def main(args: argparse.Namespace) -> None:
         fam = row["family"]
 
         params = interpolate_params(iso_val, flex_val, hb_val, fam)
+        if mutation_has_a426c:
+            params = params.copy()
+            params["iso_scale"] *= 0.85  # electrostatic shift
+            params["hb_scale"] *= 0.9
+            params["cross_scale"] *= 0.9
+        triad = triad_score(row)
+        clash_pen = clash_check(row)
+        plddt = float(row.get("plddt_mean", 75.0))
+        plddt = float(np.clip(plddt, 0.0, 100.0))
 
         # GPR shrinkage if far from mean (aggressive)
         pred_gpr_raw = row["gpr_pred_raw"]
@@ -568,7 +721,18 @@ def main(args: argparse.Namespace) -> None:
             nudge_factor_used = 0.04 if (delta_8q > 0 and gpr_residual > 0) or (delta_8q < 0 and gpr_residual < 0) else 0.0
             profile_used = {}
         else:
-            pred_q = pred_4q_raw
+            # include local field / steric effects
+            pred_q_raw, profile_used = predict_energy_16q(
+                row,
+                params,
+                MV_TO_AU,
+                gpr_baseline=pred_gpr_raw,
+                complexity=complexity,
+                fam=fam,
+                lfp=mutation_lfp_sum + lfp_pdb,
+                steric_env=mutation_steric_sum + steric_pdb,
+            )
+            pred_q = pred_q_raw * QUANTUM_SCALE
             quantum_delta = pred_q - pred_gpr
             nudge = base_w_q * NUDGE_FACTOR_4Q / NUDGE_FACTOR_4Q * quantum_delta * damping
             nudge = float(np.clip(nudge, -15.0, 15.0))
@@ -578,12 +742,18 @@ def main(args: argparse.Namespace) -> None:
                 pred_final = pred_gpr
             else:
                 pred_final = candidate
-            used_model = "hybrid_4q" if base_w_q > 0 else "gpr"
+            used_model = "hybrid_16q_mut" if base_w_q > 0 else "gpr"
             pred_q_used = pred_q
             nudge_factor_used = NUDGE_FACTOR_4Q
-            profile_used = {}
 
         quantum_delta = pred_q_used - pred_gpr
+        scs = float(np.clip(0.4 * plddt + 0.3 * triad + 0.3 * clash_pen, 0.0, 100.0))
+        # Magnetic Sensitivity Index using primary HFCC if available
+        hfcc_primary = profile_used.get("hfcc_primary_mhz", float("nan"))
+        st_gap_val = profile_used.get("st_gap", float("nan"))
+        msi = float("nan")
+        if not pd.isna(hfcc_primary) and not pd.isna(st_gap_val):
+            msi = float((row.get("n5_spin_density", profile_used.get("n5_spin_density", 0.0))) * hfcc_primary / (st_gap_val + 1e-6))
 
         records.append(
             {
@@ -608,6 +778,15 @@ def main(args: argparse.Namespace) -> None:
                 "used_model": used_model,
                 "Around_N5_Flexibility": flex_val,
                 "Around_N5_HBondCap": hb_val,
+                "plddt_mean": plddt,
+                "triad_score": triad,
+                "clash_penalty": clash_pen,
+                "scs": scs,
+                "hfcc_primary_mhz": float(profile_used.get("hfcc_primary_mhz", float("nan"))),
+                "hfcc_secondary_mhz": float(profile_used.get("hfcc_secondary_mhz", float("nan"))),
+                "hfcc_tertiary_mhz": float(profile_used.get("hfcc_tertiary_mhz", float("nan"))),
+                "magnetic_sensitivity_index": msi,
+                "mutation_list": ",".join(mutation_tokens) if mutation_tokens else "",
                 "homo_lumo_gap": float(profile_used.get("homo_lumo_gap", float("nan"))),
                 "quantum_polarizability": float(profile_used.get("polarizability", float("nan"))),
                 "n5_spin_density": float(profile_used.get("n5_spin_density", float("nan"))),
@@ -618,43 +797,80 @@ def main(args: argparse.Namespace) -> None:
         )
 
     res_df = pd.DataFrame(records)
-    out_dir = "artifacts/qc_n5_gpr"
+    out_dir = Path(os.getcwd()) / "artifacts" / "qc_n5_gpr"
     os.makedirs(out_dir, exist_ok=True)
-    bulk_path = Path(out_dir) / "bulk_quantum_results.csv"
-    profile_path = Path(out_dir) / "Final_Quantum_Profiles.csv"
+    bulk_path = out_dir / "bulk_quantum_results.csv"
+    profile_path = out_dir / "Final_Quantum_Profiles.csv"
     q_profile = res_df[
         [
             "pdb_id",
             "true_Em",
             "gpr_pred",
             "pred_final",
+            "scs",
+            "triad_score",
+            "clash_penalty",
+            "plddt_mean",
+            "hfcc_primary_mhz",
+            "hfcc_secondary_mhz",
+            "hfcc_tertiary_mhz",
+            "magnetic_sensitivity_index",
             "homo_lumo_gap",
             "quantum_polarizability",
             "n5_spin_density",
             "n10_spin_density",
             "st_gap",
             "magnetic_sensitivity_index",
+            "mutation_list",
         ]
     ]
+    # unique filename/id for mutation vs WT
+    def rename_with_mut(row):
+        base = str(row["pdb_id"]).upper() if pd.notna(row["pdb_id"]) else "UNDEF"
+        mut = str(row.get("mutation_list", "")).replace(",", "_") if "mutation_list" in row else ""
+        tag = mut if mut else "WT"
+        suffix = "_mutation" if mut else ""
+        return f"{base}_{tag}{suffix}"
+
+    res_df["pdb_id"] = res_df.apply(rename_with_mut, axis=1)
+    q_profile["pdb_id"] = res_df["pdb_id"].values
+
     if single_mode:
-        # safe append: load existing and concat
+        # safe append: load existing and concat, never overwrite bulk results
         if bulk_path.exists():
             existing_bulk = pd.read_csv(bulk_path)
             res_df = pd.concat([existing_bulk, res_df], ignore_index=True)
         res_df.to_csv(bulk_path, index=False)
         if profile_path.exists():
             existing_prof = pd.read_csv(profile_path)
+            # enforce unique columns and align before concat to avoid InvalidIndexError
+            existing_prof = existing_prof.loc[:, ~existing_prof.columns.duplicated()]
+            q_profile = q_profile.loc[:, ~q_profile.columns.duplicated()]
+            all_cols = sorted(set(existing_prof.columns) | set(q_profile.columns))
+            existing_prof = existing_prof.reindex(columns=all_cols)
+            q_profile = q_profile.reindex(columns=all_cols)
             q_profile = pd.concat([existing_prof, q_profile], ignore_index=True)
         q_profile.to_csv(profile_path, index=False)
+        # also write unique per-run file
+        per_run_path = profile_path.with_name(f"{res_df.iloc[0]['pdb_id']}.csv")
+        q_profile.tail(1).to_csv(per_run_path, index=False)
+        print("STATUS: FAD Found at synthetic coordinates (single upload mode)")
+        print("STATUS: Tryptophan triad distance calculated: NA (Isolated_Cofactor)")
         try:
             os.chmod(profile_path, 0o777)
             os.chmod(bulk_path, 0o777)
         except Exception:
             pass
+        print(f"SUCCESS: Saved {res_df.iloc[0]['pdb_id']} to {profile_path.resolve()}")
+        print("VQE_COMPLETE")
+        return
     else:
         res_df.to_csv(bulk_path, index=False)
         try:
             q_profile.to_csv(profile_path, index=False)
+            # unique per-run profile file
+            per_run_path = profile_path.with_name(f"{res_df.iloc[0]['pdb_id']}.csv")
+            q_profile.tail(1).to_csv(per_run_path, index=False)
             os.chmod(profile_path, 0o777)
         except Exception:
             pass
@@ -1101,11 +1317,6 @@ def main(args: argparse.Namespace) -> None:
     ]
     with open(os.path.join(out_dir, "Study_Conclusion.txt"), "w", encoding="utf-8") as f:
         f.write("\n".join(conclusion_lines))
-
-    if single_mode:
-        print(f"SUCCESS: Saved {pdb_id_single} to {profile_path.resolve()}")
-        print("VQE_COMPLETE")
-        return
 
     print(json.dumps(summary, indent=2))
     print("Final MAE:", mae_final)

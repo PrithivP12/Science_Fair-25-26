@@ -6,7 +6,7 @@ selection_metric: MAE
 selection_split: cv
 tuning: true
 tune_trials: 20
-models: [catboost, extratrees, ensemble]
+models: [catboost, extratrees, gpr, ensemble]
 ensemble: true
 
 data:
@@ -42,3 +42,6 @@ xgboost:
   tree_method: gpu_hist
   predictor: gpu_predictor
   eval_metric: rmse
+
+gpr:
+  n_restarts_optimizer: 2

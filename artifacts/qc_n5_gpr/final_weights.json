@@ -7,7 +7,7 @@
   "complexity_damping": "1/(1+complexity)",
   "gpr_shrinkage_sd": 1.5,
   "gpr_shrinkage_pull": 0.7,
-  "sigma_median": 83.3442177792686,
-  "gpr_mean": -225.4340840597911,
-  "gpr_std": 70.07948025153038
+  "sigma_median": 0.004471030059204452,
+  "gpr_mean": -224.36666666666665,
+  "gpr_std": 0.0
 }

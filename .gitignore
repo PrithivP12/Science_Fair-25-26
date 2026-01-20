@@ -1,11 +1,5 @@
+artifacts/
+research_archives/
 __pycache__/
 *.pyc
-.ipynb_checkpoints/
-artifacts/
-catboost_info/
 .DS_Store
-
-# Local data outputs
-data/redox_dataset_preprocessed.csv
-data/redox_dataset_preprocessed.parquet
-data/redox_dataset_merged.csv

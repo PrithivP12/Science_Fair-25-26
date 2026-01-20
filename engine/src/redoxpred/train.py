@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional, Callable
 import logging
 import os
 
@@ -13,22 +13,39 @@ from sklearn.linear_model import Ridge
 from sklearn.inspection import permutation_importance
 from sklearn.pipeline import Pipeline
 from sklearn.ensemble import ExtraTreesRegressor
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, WhiteKernel, ConstantKernel
 
 from .config import Config, load_config
 from .data import load_dataset
-from .evaluate import regression_metrics, cofactor_metrics, tolerance_metrics, plot_diagnostics
+from .evaluate import regression_metrics, cofactor_metrics, tolerance_metrics, plot_diagnostics, uncertainty_diagnostics
 from .features import (
     FeatureSpec,
     add_missing_indicators,
     build_feature_spec,
     make_linear_preprocessor,
+    make_gpr_preprocessor,
     make_tree_preprocessor,
     prepare_catboost_frame,
 )
 from .split import GROUP_COL, group_kfold_indices, train_val_test_split
 from .utils import ensure_dir, save_json, set_seed
 from .explain import plot_feature_importance, plot_shap_summary
-from .evaluate import regression_metrics, cofactor_metrics, tolerance_metrics, plot_diagnostics
+
+FORBIDDEN_COLUMNS = [
+    "uniprot_id",
+    "pdb_id",
+    "structure_path",
+    "cof_chain",
+    "cof_resseq",
+    "cof_icode",
+    "method",
+    "source",
+    "measurement_note",
+    "group_std",
+    "group_n",
+    "sample_weight",
+]
 
 
 def _write_condition_audit(df: pd.DataFrame, out_path: str) -> None:
@@ -100,6 +117,73 @@ def _make_dirs(artifacts_dir: str) -> Dict[str, str]:
     for p in paths.values():
         ensure_dir(p)
     return paths
+
+
+def _write_feature_audit(
+    df: pd.DataFrame,
+    spec: FeatureSpec,
+    forbidden: List[str],
+    out_path: str,
+) -> None:
+    ensure_dir(os.path.dirname(out_path))
+    all_cols = [c for c in df.columns if c != "Em"]
+    used = set(spec.feature_cols)
+    forbidden_set = set(forbidden)
+    dropped = [(c, spec.drop_reasons.get(c, "other")) for c in all_cols if c not in used]
+    dropped = sorted(dropped, key=lambda x: x[0])[:20]
+    has_forbidden = used.intersection(forbidden_set)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("# Feature Audit\n\n")
+        f.write(f"- Numeric features: {len(spec.numeric_cols)}\n")
+        f.write(f"- Categorical features: {len(spec.categorical_cols)}\n")
+        f.write(f"- Forbidden columns present in final matrix: {'YES' if has_forbidden else 'NO'}\n")
+        if has_forbidden:
+            f.write(f"  - Offending columns: {sorted(has_forbidden)}\n")
+        f.write("\n## Dropped columns (top 20)\n")
+        if not dropped:
+            f.write("None dropped\n")
+        else:
+            for col, reason in dropped:
+                f.write(f"- {col}: {reason}\n")
+
+
+def _compute_sample_weights(
+    df: pd.DataFrame,
+    base_indices: List[int],
+    target_indices: List[int],
+) -> np.ndarray:
+    base = df.iloc[base_indices].copy()
+
+    def _bin_ph(series: pd.Series) -> pd.Series:
+        return series.apply(lambda x: round(x * 2) / 2 if pd.notna(x) else "missing").astype(str)
+
+    def _bin_temp(series: pd.Series) -> pd.Series:
+        return series.apply(lambda x: round(x / 5) * 5 if pd.notna(x) else "missing").astype(str)
+
+    base["_pH_bin"] = _bin_ph(base["pH"]) if "pH" in base else "missing"
+    base["_temp_bin"] = _bin_temp(base["temperature_C"]) if "temperature_C" in base else "missing"
+
+    stats = (
+        base.groupby(["uniprot_id", "_pH_bin", "_temp_bin"])["Em"]
+        .agg(["std", "count"])
+        .rename(columns={"std": "std", "count": "count"})
+        .reset_index()
+    )
+    stats["std"] = stats["std"].fillna(0.0)
+    stats["weight"] = 1.0 / (stats["std"] + 1.0)
+    stats["weight"] = stats["weight"].replace([np.inf, -np.inf], np.nan).fillna(1.0).clip(lower=1e-3)
+
+    target = df.iloc[target_indices].copy()
+    target["_pH_bin"] = _bin_ph(target["pH"]) if "pH" in target else "missing"
+    target["_temp_bin"] = _bin_temp(target["temperature_C"]) if "temperature_C" in target else "missing"
+
+    merged = target.merge(
+        stats[["uniprot_id", "_pH_bin", "_temp_bin", "weight"]],
+        on=["uniprot_id", "_pH_bin", "_temp_bin"],
+        how="left",
+    )
+    weights = merged["weight"].fillna(1.0).values
+    return weights
 
 
 def _eval_split(df: pd.DataFrame, y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, Any]:
@@ -241,6 +325,105 @@ def _train_extratrees(
     return model, preprocessor
 
 
+def _train_gpr(
+    spec: FeatureSpec,
+    X_train: pd.DataFrame,
+    y_train: np.ndarray,
+    params: Dict[str, Any],
+) -> Tuple[Pipeline, Dict[str, Any]]:
+    preprocessor = make_gpr_preprocessor(spec)
+    preprocessor.fit(X_train)
+    n_features = preprocessor.transform(X_train[:1]).shape[1]
+    if n_features <= 0:
+        raise ValueError("No features available for GPR")
+
+    ard_kernel = ConstantKernel(1.0, (1e-2, 1e2)) * RBF(
+        length_scale=np.ones(n_features), length_scale_bounds=(1e-2, 1e3)
+    ) + WhiteKernel(noise_level=1.0, noise_level_bounds=(1e-5, 1e2))
+    iso_kernel = ConstantKernel(1.0, (1e-2, 1e2)) * RBF(
+        length_scale=1.0, length_scale_bounds=(1e-2, 1e3)
+    ) + WhiteKernel(noise_level=1.0, noise_level_bounds=(1e-5, 1e2))
+
+    random_state = params.get("random_state", 0)
+    restarts = int(params.get("n_restarts_optimizer", 2))
+
+    def _make_gp(kernel, restarts_override: int):
+        return GaussianProcessRegressor(
+            kernel=kernel,
+            normalize_y=True,
+            random_state=random_state,
+            n_restarts_optimizer=restarts_override,
+        )
+
+    gp = _make_gp(ard_kernel, restarts)
+    pipe = Pipeline([("preprocess", preprocessor), ("model", gp)])
+    kernel_used = "ard"
+    try:
+        pipe.fit(X_train, y_train)
+    except Exception as exc:
+        logging.warning("GPR ARD kernel failed (%s). Falling back to isotropic kernel.", exc)
+        gp = _make_gp(iso_kernel, max(1, restarts // 2 or 1))
+        pipe = Pipeline([("preprocess", preprocessor), ("model", gp)])
+        pipe.fit(X_train, y_train)
+        kernel_used = "isotropic"
+    return pipe, {"n_features": n_features, "kernel_used": kernel_used}
+
+
+def _save_gpr_artifacts(
+    df_test: pd.DataFrame,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    y_std: np.ndarray,
+    paths: Dict[str, str],
+) -> None:
+    ensure_dir(paths["reports"])
+    ensure_dir(paths["figures"])
+
+    def _col(name: str) -> np.ndarray:
+        if name in df_test.columns:
+            return df_test[name].values
+        return np.full(len(df_test), np.nan)
+
+    preds_df = pd.DataFrame(
+        {
+            "uniprot_id": _col("uniprot_id"),
+            "pdb_id": _col("pdb_id"),
+            "Em_true": y_true,
+            "Em_pred": y_pred,
+            "Em_std": y_std,
+            "abs_error": np.abs(y_true - y_pred),
+            "pH": _col("pH"),
+            "temperature_C": _col("temperature_C"),
+            "cofactor": _col("cofactor"),
+        }
+    )
+    preds_path = os.path.join(paths["reports"], "preds_gpr_test.csv")
+    preds_df.to_csv(preds_path, index=False)
+
+    # Pred vs True with error bars
+    plt.figure(figsize=(6, 6))
+    plt.errorbar(y_true, y_pred, yerr=y_std, fmt="o", alpha=0.6, markersize=4, ecolor="gray", capsize=2)
+    min_v = float(min(preds_df["Em_true"].min(), preds_df["Em_pred"].min()))
+    max_v = float(max(preds_df["Em_true"].max(), preds_df["Em_pred"].max()))
+    plt.plot([min_v, max_v], [min_v, max_v], color="black", linestyle="--", linewidth=1)
+    plt.xlabel("True Em (mV)")
+    plt.ylabel("Pred Em (mV)")
+    plt.title("GPR Predicted vs True (with ±1σ)")
+    plt.tight_layout()
+    plt.savefig(os.path.join(paths["figures"], "gpr_pred_vs_true.png"), dpi=150)
+    plt.close()
+
+    # Error vs std scatter
+    plt.figure(figsize=(6, 5))
+    plt.scatter(y_std, preds_df["abs_error"].values, alpha=0.65, s=18)
+    plt.xlabel("Predicted std (mV)")
+    plt.ylabel("Absolute error (mV)")
+    plt.title("Error vs Uncertainty (GPR)")
+    plt.tight_layout()
+    plt.savefig(os.path.join(paths["figures"], "gpr_error_vs_uncertainty.png"), dpi=150)
+    plt.close()
+
+
 def _tune_catboost(
     spec: FeatureSpec,
     X: pd.DataFrame,
@@ -249,7 +432,7 @@ def _tune_catboost(
     base_params: Dict[str, Any],
     trials: int,
     seed: int,
-    sample_weight: Optional[pd.Series],
+    weight_provider: Optional[Callable[[List[int], List[int]], np.ndarray]],
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     rng = np.random.default_rng(seed)
     results: List[Dict[str, Any]] = []
@@ -274,7 +457,7 @@ def _tune_catboost(
             y_tr = y[train_idx]
             X_va = X.iloc[val_idx]
             y_va = y[val_idx]
-            sw = sample_weight.iloc[train_idx].values if sample_weight is not None else None
+            sw = weight_provider(train_idx, train_idx) if weight_provider is not None else None
             model, med = _train_catboost(spec, X_tr, y_tr, X_va, y_va, params, sample_weight=sw)
             X_va_cb, _ = prepare_catboost_frame(X_va, spec, medians=med)
             preds = model.predict(X_va_cb)
@@ -296,7 +479,7 @@ def _tune_xgb(
     base_params: Dict[str, Any],
     trials: int,
     seed: int,
-    sample_weight: Optional[pd.Series],
+    weight_provider: Optional[Callable[[List[int], List[int]], np.ndarray]],
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     rng = np.random.default_rng(seed)
     results: List[Dict[str, Any]] = []
@@ -322,7 +505,7 @@ def _tune_xgb(
             y_tr = y[train_idx]
             X_va = X.iloc[val_idx]
             y_va = y[val_idx]
-            sw = sample_weight.iloc[train_idx].values if sample_weight is not None else None
+            sw = weight_provider(train_idx, train_idx) if weight_provider is not None else None
             model, pre = _train_xgboost(spec, X_tr, y_tr, X_va, y_va, params, sample_weight=sw)
             preds = model.predict(pre.transform(X_va))
             maes.append(regression_metrics(y_va, preds)["mae"])
@@ -343,7 +526,7 @@ def _tune_extratrees(
     base_params: Dict[str, Any],
     trials: int,
     seed: int,
-    sample_weight: Optional[pd.Series],
+    weight_provider: Optional[Callable[[List[int], List[int]], np.ndarray]],
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     rng = np.random.default_rng(seed)
     results: List[Dict[str, Any]] = []
@@ -369,7 +552,7 @@ def _tune_extratrees(
             y_tr = y[train_idx]
             X_va = X.iloc[val_idx]
             y_va = y[val_idx]
-            sw = sample_weight.iloc[train_idx].values if sample_weight is not None else None
+            sw = weight_provider(train_idx, train_idx) if weight_provider is not None else None
             model, pre = _train_extratrees(spec, X_tr, y_tr, X_va, y_va, params, sample_weight=sw)
             preds = model.predict(pre.transform(X_va))
             maes.append(regression_metrics(y_va, preds)["mae"])
@@ -543,7 +726,8 @@ def _compute_oof_preds(
     spec: FeatureSpec,
     cat_params: Dict[str, Any],
     xgb_params: Dict[str, Any],
-    sample_weight: Optional[pd.Series],
+    gpr_params: Dict[str, Any],
+    weight_provider: Optional[Callable[[List[int], List[int]], np.ndarray]],
     df: Optional[pd.DataFrame] = None,
 ) -> Optional[np.ndarray]:
     oof = np.full_like(y, fill_value=np.nan, dtype=float)
@@ -552,7 +736,7 @@ def _compute_oof_preds(
         y_tr = y[train_idx]
         X_va = X.iloc[val_idx]
         y_va = y[val_idx]
-        sw = sample_weight.iloc[train_idx].values if sample_weight is not None else None
+        sw = weight_provider(train_idx, train_idx) if weight_provider is not None else None
         if name == "catboost":
             model, med = _train_catboost(spec, X_tr, y_tr, X_va, y_va, cat_params, sample_weight=sw)
             X_va_cb, _ = prepare_catboost_frame(X_va, spec, medians=med)
@@ -563,6 +747,9 @@ def _compute_oof_preds(
         elif name == "extratrees":
             model, pre = _train_extratrees(spec, X_tr, y_tr, X_va, y_va, {}, sample_weight=sw)
             preds = model.predict(pre.transform(X_va))
+        elif name == "gpr":
+            model, _ = _train_gpr(spec, X_tr, y_tr, gpr_params)
+            preds, _ = model.predict(X_va, return_std=True)
         elif name == "catboost_delta":
             if df is None:
                 return None
@@ -613,6 +800,7 @@ def run_training(config_path: str, tune_override: Optional[bool] = None, models_
             catboost_params=config.catboost_params,
             ridge_params=config.ridge_params,
             xgb_params=config.xgb_params,
+            gpr_params=config.gpr_params,
         )
     if models_override is not None:
         config = Config(
@@ -631,6 +819,7 @@ def run_training(config_path: str, tune_override: Optional[bool] = None, models_
             catboost_params=config.catboost_params,
             ridge_params=config.ridge_params,
             xgb_params=config.xgb_params,
+            gpr_params=config.gpr_params,
         )
     set_seed(config.random_seed)
     logging.info("Loading data: %s", config.data_path)
@@ -667,10 +856,10 @@ def run_training(config_path: str, tune_override: Optional[bool] = None, models_
     paths = _make_dirs(config.artifacts_dir)
     save_json(os.path.join(paths["reports"], "splits.json"), splits)
     _write_condition_audit(df, os.path.join(paths["reports"], "condition_audit.md"))
+    _write_feature_audit(df, spec, FORBIDDEN_COLUMNS, os.path.join(paths["reports"], "feature_audit.md"))
 
     X = df[spec.feature_cols]
     y = df["Em"].values
-    sample_weight = df.get("sample_weight")
     # Baselines for delta models
     baseline_map_train, baseline_default = _baseline_map(df, splits["train"])
     baseline_train_vals = _baseline_values(baseline_map_train, baseline_default, df.iloc[splits["train"]]["uniprot_id"])
@@ -687,6 +876,13 @@ def run_training(config_path: str, tune_override: Optional[bool] = None, models_
     y_train = y[splits["train"]]
     y_val = y[splits["val"]]
     y_test = y[splits["test"]]
+
+    def _weights(base_idx: List[int], target_idx: List[int]) -> np.ndarray:
+        return _compute_sample_weights(df, base_idx, target_idx)
+
+    train_weights = _weights(splits["train"], splits["train"])
+    val_weights = _weights(splits["train"], splits["val"])
+    test_weights = _weights(splits["train"], splits["test"])
 
     model_enabled = {m.lower() for m in config.models}
 
@@ -800,6 +996,10 @@ def run_training(config_path: str, tune_override: Optional[bool] = None, models_
         "random_state": config.random_seed,
         "n_jobs": -1,
     }
+    gpr_params = {
+        "random_state": config.random_seed,
+        "n_restarts_optimizer": config.gpr_params.get("n_restarts_optimizer", 2),
+    }
     tuning_results: List[Dict[str, Any]] = []
     if config.tune:
         if "catboost" in model_enabled:
@@ -811,7 +1011,7 @@ def run_training(config_path: str, tune_override: Optional[bool] = None, models_
                 cat_params,
                 config.tune_trials,
                 config.random_seed,
-                sample_weight,
+                lambda tr, va: _weights(tr, tr),
             )
             cat_params.update(tuned)
             tuning_results.extend(results)
@@ -824,7 +1024,7 @@ def run_training(config_path: str, tune_override: Optional[bool] = None, models_
                 xgb_params,
                 config.tune_trials,
                 config.random_seed,
-                sample_weight,
+                lambda tr, va: _weights(tr, tr),
             )
             xgb_params.update(tuned)
             tuning_results.extend(results)
@@ -837,13 +1037,12 @@ def run_training(config_path: str, tune_override: Optional[bool] = None, models_
                 extra_params,
                 config.tune_trials,
                 config.random_seed,
-                sample_weight,
+                lambda tr, va: _weights(tr, tr),
             )
             extra_params.update(tuned)
             tuning_results.extend(results)
     if "catboost" in model_enabled:
         try:
-            sw_train = sample_weight.iloc[splits["train"]].values if sample_weight is not None else None
             cat_model, medians = _train_catboost(
                 spec,
                 X_train,
@@ -851,7 +1050,7 @@ def run_training(config_path: str, tune_override: Optional[bool] = None, models_
                 X_val,
                 y_val,
                 cat_params,
-                sample_weight=sw_train,
+                sample_weight=train_weights,
             )
             models["catboost"] = cat_model
             cat_medians = medians
@@ -880,8 +1079,7 @@ def run_training(config_path: str, tune_override: Optional[bool] = None, models_
     # XGBoost
     if "xgb" in model_enabled:
         try:
-            sw_train = sample_weight.iloc[splits["train"]].values if sample_weight is not None else None
-            xgb_model, xgb_pre = _train_xgboost(spec, X_train, y_train, X_val, y_val, xgb_params, sample_weight=sw_train)
+            xgb_model, xgb_pre = _train_xgboost(spec, X_train, y_train, X_val, y_val, xgb_params, sample_weight=train_weights)
             models["xgb"] = {"model": xgb_model, "preprocess": xgb_pre}
             X_train_t = xgb_pre.transform(X_train)
             X_val_t = xgb_pre.transform(X_val)
@@ -908,7 +1106,6 @@ def run_training(config_path: str, tune_override: Optional[bool] = None, models_
     # ExtraTrees
     if "extratrees" in model_enabled:
         try:
-            sw_train = sample_weight.iloc[splits["train"]].values if sample_weight is not None else None
             et_model, et_pre = _train_extratrees(
                 spec,
                 X_train,
@@ -916,7 +1113,7 @@ def run_training(config_path: str, tune_override: Optional[bool] = None, models_
                 X_val,
                 y_val,
                 extra_params,
-                sample_weight=sw_train,
+                sample_weight=train_weights,
             )
             models["extratrees"] = {"model": et_model, "preprocess": et_pre}
             X_train_e = et_pre.transform(X_train)
@@ -940,6 +1137,51 @@ def run_training(config_path: str, tune_override: Optional[bool] = None, models_
         except Exception as exc:
             logging.error("Model extratrees failed: %s", exc)
             models_failed["extratrees"] = str(exc)
+
+    # Gaussian Process Regression
+    if "gpr" in model_enabled:
+        try:
+            gpr_model, gpr_info = _train_gpr(
+                spec,
+                X_train,
+                y_train,
+                gpr_params,
+            )
+            train_pred, train_std = gpr_model.predict(X_train, return_std=True)
+            val_pred, val_std = gpr_model.predict(X_val, return_std=True)
+            test_pred, test_std = gpr_model.predict(X_test, return_std=True)
+
+            train_df = df.iloc[splits["train"]].copy()
+            val_df = df.iloc[splits["val"]].copy()
+            test_df = df.iloc[splits["test"]].copy()
+            train_df["Em_std"] = train_std
+            val_df["Em_std"] = val_std
+            test_df["Em_std"] = test_std
+
+            metrics_by_model["gpr"] = {
+                "train": _eval_split(train_df, y_train, train_pred),
+                "val": _eval_split(val_df, y_val, val_pred),
+                "test": _eval_split(test_df, y_test, test_pred),
+                "uncertainty": {
+                    "test": uncertainty_diagnostics(y_test, test_pred, test_std),
+                },
+                "gpr_info": gpr_info,
+            }
+            bundles["gpr"] = {
+                "model_type": "gpr",
+                "model": gpr_model,
+                "feature_cols": spec.feature_cols,
+                "categorical_cols": spec.categorical_cols,
+                "numeric_cols": spec.numeric_cols,
+                "dropped_all_nan": spec.dropped_all_nan,
+                "gpr_info": gpr_info,
+            }
+            models["gpr"] = gpr_model
+            _save_gpr_artifacts(test_df, y_test, test_pred, test_std, paths)
+            models_succeeded.append("gpr")
+        except Exception as exc:
+            logging.error("Model gpr failed: %s", exc)
+            models_failed["gpr"] = str(exc)
 
     # Simple ensemble of catboost + extratrees
     if "ensemble" in model_enabled and "catboost" in models and "extratrees" in models:
@@ -983,7 +1225,6 @@ def run_training(config_path: str, tune_override: Optional[bool] = None, models_
             y_train_delta = y_train - baseline_train_vals
             y_val_delta = y_val - baseline_val_vals
             y_test_delta = y_test - baseline_test_vals
-            sw_train = sample_weight.iloc[splits["train"]].values if sample_weight is not None else None
             cat_model_delta, medians_delta = _train_catboost(
                 spec,
                 X_train,
@@ -991,7 +1232,7 @@ def run_training(config_path: str, tune_override: Optional[bool] = None, models_
                 X_val,
                 y_val_delta,
                 cat_params,
-                sample_weight=sw_train,
+                sample_weight=train_weights,
             )
             X_train_cb, _ = prepare_catboost_frame(X_train, spec, medians=medians_delta)
             X_val_cb, _ = prepare_catboost_frame(X_val, spec, medians=medians_delta)
@@ -1032,7 +1273,6 @@ def run_training(config_path: str, tune_override: Optional[bool] = None, models_
             y_train_delta = y_train - baseline_train_vals
             y_val_delta = y_val - baseline_val_vals
             y_test_delta = y_test - baseline_test_vals
-            sw_train = sample_weight.iloc[splits["train"]].values if sample_weight is not None else None
             xgb_model_delta, xgb_pre_delta = _train_xgboost(
                 spec,
                 X_train,
@@ -1040,7 +1280,7 @@ def run_training(config_path: str, tune_override: Optional[bool] = None, models_
                 X_val,
                 y_val_delta,
                 xgb_params,
-                sample_weight=sw_train,
+                sample_weight=train_weights,
             )
             X_train_t = xgb_pre_delta.transform(X_train)
             X_val_t = xgb_pre_delta.transform(X_val)
@@ -1137,7 +1377,7 @@ def run_training(config_path: str, tune_override: Optional[bool] = None, models_
 
         # CatBoost
         if "catboost" in models_succeeded:
-            sw = sample_weight.iloc[train_idx].values if sample_weight is not None else None
+            sw = _weights(train_idx, train_idx)
             cat_cv, med_cv = _train_catboost(spec, X_tr, y_tr, X_va, y_va, cat_params, sample_weight=sw)
             X_va_cb, _ = prepare_catboost_frame(X_va, spec, medians=med_cv)
             cv_metrics["catboost"]["folds"].append(
@@ -1145,14 +1385,21 @@ def run_training(config_path: str, tune_override: Optional[bool] = None, models_
             )
 
         if "extratrees" in models_succeeded:
-            sw = sample_weight.iloc[train_idx].values if sample_weight is not None else None
+            sw = _weights(train_idx, train_idx)
             et_cv, et_pre = _train_extratrees(spec, X_tr, y_tr, X_va, y_va, extra_params, sample_weight=sw)
             cv_metrics["extratrees"]["folds"].append(
                 {"fold": fold_idx, "metrics": regression_metrics(y_va, et_cv.predict(et_pre.transform(X_va)))}
             )
 
+        if "gpr" in models_succeeded:
+            gpr_cv, _ = _train_gpr(spec, X_tr, y_tr, gpr_params)
+            gpr_pred, _ = gpr_cv.predict(X_va, return_std=True)
+            cv_metrics["gpr"]["folds"].append(
+                {"fold": fold_idx, "metrics": regression_metrics(y_va, gpr_pred)}
+            )
+
         if "ensemble" in models_succeeded and "catboost" in models_succeeded and "extratrees" in models_succeeded:
-            sw = sample_weight.iloc[train_idx].values if sample_weight is not None else None
+            sw = _weights(train_idx, train_idx)
             cat_cv, med_cv = _train_catboost(spec, X_tr, y_tr, X_va, y_va, cat_params, sample_weight=sw)
             et_cv, et_pre = _train_extratrees(spec, X_tr, y_tr, X_va, y_va, extra_params, sample_weight=sw)
             cat_pred = cat_cv.predict(prepare_catboost_frame(X_va, spec, medians=med_cv)[0])
@@ -1257,7 +1504,8 @@ def run_training(config_path: str, tune_override: Optional[bool] = None, models_
         spec,
         cat_params,
         xgb_params,
-        sample_weight,
+        gpr_params,
+        lambda tr, va: _weights(tr, va),
         df=df,
     )
     if oof is not None:
@@ -1360,6 +1608,16 @@ def run_training(config_path: str, tune_override: Optional[bool] = None, models_
         f.write("\n## Test metrics (not used for selection)\n")
         for line in _render_metrics_table(metrics_by_model, cv_agg, "test", include_std=False):
             f.write(f"{line}\n")
+        if "gpr" in metrics_by_model and metrics_by_model["gpr"].get("uncertainty"):
+            unc = metrics_by_model["gpr"]["uncertainty"].get("test")
+            if unc:
+                f.write("\n## GPR uncertainty diagnostics (test)\n")
+                f.write(
+                    f"- avg_pred_std={unc['avg_pred_std']:.3f}\n"
+                    f"- spearman_abs_err_vs_std={unc['spearman_abs_err_vs_std']:.3f}\n"
+                    f"- coverage_within_1sigma={unc['coverage_1sigma']:.3f}\n"
+                    f"- coverage_within_2sigma={unc['coverage_2sigma']:.3f}\n"
+                )
         f.write("\n## Artifacts\n")
         f.write(f"- Models: {paths['models']}\n")
         f.write(f"- Reports: {paths['reports']}\n")

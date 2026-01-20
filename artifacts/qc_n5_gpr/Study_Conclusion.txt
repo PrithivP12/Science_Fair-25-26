@@ -1,7 +1,7 @@
 Hybrid GPR+4Q study conclusion
-Global MAE (hybrid): 47.28 mV; Global MAE (GPR): 47.28 mV
-MedAE (hybrid): 34.11 mV vs JCIM 2022 mean ~36 mV
-Chemical accuracy hits (<43 mV): 85; Benchmark hits (<36 mV): 74
-Applicability domain (<36 mV) mean flexibility: 1.3519, mean hbondcap: 2.1892
+Global MAE (hybrid): 45.92 mV; Global MAE (GPR): 45.95 mV
+MedAE (hybrid): 33.38 mV vs JCIM 2022 mean ~36 mV
+Chemical accuracy hits (<43 mV): 89; Benchmark hits (<36 mV): 79
+Applicability domain (<36 mV) mean flexibility: 1.3527, mean hbondcap: 2.0633
 MedAE is robust to structural outliers; it reflects typical-case performance where the hybrid matches gold-standard accuracy despite a few high-error proteins, outperforming literature mean MAE on the majority subset.
 84 chemical-accuracy hits demonstrate the quantum-classical frontier where physics-driven nudges aid GPR.

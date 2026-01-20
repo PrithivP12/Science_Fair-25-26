@@ -23,6 +23,7 @@ class Config:
     catboost_params: Dict[str, Any]
     ridge_params: Dict[str, Any]
     xgb_params: Dict[str, Any]
+    gpr_params: Dict[str, Any]
 
 
 def load_config(path: str) -> Config:
@@ -48,6 +49,7 @@ def load_config(path: str) -> Config:
     catboost_params = raw.get("catboost", {})
     ridge_params = raw.get("ridge", {})
     xgb_params = raw.get("xgboost", {})
+    gpr_params = raw.get("gpr", {})
 
     return Config(
         data_path=data_path,
@@ -65,4 +67,5 @@ def load_config(path: str) -> Config:
         catboost_params=catboost_params,
         ridge_params=ridge_params,
         xgb_params=xgb_params,
+        gpr_params=gpr_params,
     )

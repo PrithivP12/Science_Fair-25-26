@@ -57,33 +57,11 @@ def preprocess_dataframe(df: pd.DataFrame) -> Tuple[pd.DataFrame, PreprocessRepo
     df["has_temp"] = df["temperature_C"].notna().astype(int)
     df["pH_centered"] = df["pH"] - 7.0
     df["pH_sq"] = df["pH_centered"] ** 2
-    df["temperature_centered"] = df["temperature_C"] - 25.0
-
-    # Bins for group stats (but keep all rows)
-    df["pH_bin"] = df["pH"].apply(lambda x: round(x * 2) / 2 if pd.notna(x) else "missing")
-    df["temp_bin"] = df["temperature_C"].apply(lambda x: round(x / 5) * 5 if pd.notna(x) else "missing")
-    df["pH_bin"] = df["pH_bin"].astype(str)
-    df["temp_bin"] = df["temp_bin"].astype(str)
-
-    # Group stats per (uniprot_id, pH_bin, temp_bin)
-    grp = df.groupby(["uniprot_id", "pH_bin", "temp_bin"])
-    stats = grp[TARGET_COL].agg(["std", "count"]).rename(columns={"std": "group_std", "count": "group_n"})
-    stats["group_std"] = stats["group_std"].fillna(0.0)
-    stats = stats.reset_index()
-    df = df.merge(stats, on=["uniprot_id", "pH_bin", "temp_bin"], how="left")
-    df["sample_weight"] = 1.0 / (df["group_std"] + 1.0)
-    df["sample_weight"] = df["sample_weight"].replace([np.inf, -np.inf], np.nan).fillna(1.0)
-    df["sample_weight"] = df["sample_weight"].clip(lower=1e-3)
 
     frac_missing_ph_after = float(df["pH"].isna().mean())
     frac_missing_temp_after = float(df["temperature_C"].isna().mean())
 
-    group_stats = {
-        "group_n_min": float(df["group_n"].min()),
-        "group_n_max": float(df["group_n"].max()),
-        "group_n_mean": float(df["group_n"].mean()),
-        "group_n_median": float(df["group_n"].median()),
-    }
+    group_stats = {}
 
     # Proteins with widest Em range across conditions (from original df)
     ranges = df.groupby("uniprot_id")[TARGET_COL].agg(["min", "max"])
@@ -117,10 +95,11 @@ def _write_report(report: PreprocessReport, path: Path) -> None:
         f.write(
             f"- Missing temperature: before {report.frac_missing_temp_before*100:.2f}% | after {report.frac_missing_temp_after*100:.2f}%\n"
         )
-        f.write(
-            f"- group_n stats: min={report.group_stats['group_n_min']}, median={report.group_stats['group_n_median']}, "
-            f"mean={report.group_stats['group_n_mean']:.2f}, max={report.group_stats['group_n_max']}\n"
-        )
+        if report.group_stats:
+            f.write(
+                f"- group_n stats: min={report.group_stats.get('group_n_min')}, median={report.group_stats.get('group_n_median')}, "
+                f"mean={report.group_stats.get('group_n_mean')}, max={report.group_stats.get('group_n_max')}\n"
+            )
         f.write("\n## Proteins with widest Em range\n")
         f.write("uniprot_id,min,max,Em_range\n")
         for idx, row in report.widest_proteins.iterrows():

@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import matplotlib.pyplot as plt
+from scipy.stats import spearmanr
 
 
 def regression_metrics(y_true, y_pred) -> Dict[str, float]:
@@ -87,3 +88,26 @@ def plot_diagnostics(
         plt.tight_layout()
         plt.savefig(f"{out_dir}/residuals_vs_pH.png", dpi=150)
         plt.close()
+
+
+def uncertainty_diagnostics(y_true: np.ndarray, y_pred: np.ndarray, y_std: np.ndarray) -> Dict[str, float]:
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    y_std = np.asarray(y_std)
+    abs_err = np.abs(y_true - y_pred)
+    avg_std = float(np.nanmean(y_std))
+
+    if np.all(np.isnan(y_std)):
+        spearman = float("nan")
+    else:
+        spearman = float(spearmanr(abs_err, y_std, nan_policy="omit").correlation)
+
+    within_1sigma = float(np.mean((y_true >= y_pred - y_std) & (y_true <= y_pred + y_std)))
+    within_2sigma = float(np.mean((y_true >= y_pred - 2 * y_std) & (y_true <= y_pred + 2 * y_std)))
+
+    return {
+        "avg_pred_std": avg_std,
+        "spearman_abs_err_vs_std": spearman,
+        "coverage_1sigma": within_1sigma,
+        "coverage_2sigma": within_2sigma,
+    }
