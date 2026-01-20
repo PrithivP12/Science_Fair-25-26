@@ -1,6 +1,4 @@
 artifacts/
-research_archive/
-pdbs/*.pdb
 __pycache__/
 *.pyc
 .DS_Store

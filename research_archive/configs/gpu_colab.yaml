@@ -1,0 +1,40 @@
+random_seed: 42
+test_size: 0.2
+val_size: 0.1
+n_splits: 5
+selection_metric: MAE
+selection_split: cv
+tuning: true
+tune_trials: 20
+models: [catboost, xgb, ensemble]
+ensemble: true
+
+data:
+  path: data/redox_dataset.csv
+
+artifacts:
+  dir: artifacts
+
+catboost:
+  depth: 8
+  learning_rate: 0.05
+  iterations: 500
+  l2_leaf_reg: 3.0
+  loss_function: MAE
+  eval_metric: MAE
+  subsample: 0.8
+  task_type: GPU
+  devices: "0"
+
+xgboost:
+  max_depth: 6
+  learning_rate: 0.05
+  n_estimators: 400
+  min_child_weight: 1.0
+  subsample: 0.8
+  colsample_bytree: 0.8
+  reg_lambda: 1.0
+  objective: reg:absoluteerror
+  tree_method: gpu_hist
+  predictor: gpu_predictor
+  eval_metric: mae

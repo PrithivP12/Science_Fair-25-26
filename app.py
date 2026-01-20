@@ -62,6 +62,8 @@ def check_directories():
         BASE_DIR / "artifacts",
         BASE_DIR / "artifacts" / "qc_n5_gpr",
         BASE_DIR / "pdbs",
+        BASE_DIR / "data",
+        BASE_DIR / "data" / "pdb",
     ]
     for d in target_dirs:
         d.mkdir(parents=True, exist_ok=True)
