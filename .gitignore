@@ -1,5 +1,5 @@
 artifacts/
-research_archives/
+research_archive/
 pdbs/*.pdb
 __pycache__/
 *.pyc

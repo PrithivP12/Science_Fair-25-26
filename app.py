@@ -116,6 +116,8 @@ def main():
     )
     st.title("FLAVIN-OPT: Quantum-Driven Protein Brightness Lab")
     st.header("OOK: Quantum-Driven Protein Engineering Suite v1.0")
+    st.sidebar.markdown("### About")
+    st.sidebar.info("OOK combines 16-qubit VQE with Generalized Quantum Field Perturbation to predict flavin brightness and guide protein engineering.")
     reload_token = st.session_state.get("reload_token", 0)
     bulk, qprof, scorecard = load_data(reload_token)
     # Keep idle until user triggers run
@@ -154,7 +156,7 @@ def main():
             tmp_path = tmp.name if pdb_file is not None else None
         prog = st.progress(0)
         st.info("System Status: Running VQE/GPR analysis...")
-        cmd = [sys.executable, str(BASE_DIR / "engine" / "scripts" / "vqe_n5_edge.py")]
+        cmd = [sys.executable, str(BASE_DIR / "engine" / "vqe_n5_edge.py")]
         env = os.environ.copy()
         env["MUTATION_LIST"] = mutation_list_str or ""
         if pdb_file is not None:
@@ -327,7 +329,7 @@ def main():
             st.subheader("Structural Analysis Report")
             triad_status = "NOT DETECTED"
             comp_mode_val = "Generalized Quantum Field Perturbation (GQFP)" if mutation_list_str else ("Isolated_Cofactor_Sim" if triad_status == "NOT DETECTED" else "Protein-Embedded")
-            model_src_label = pdb_file.name if pdb_file else "Standard Reference Structure"
+            model_src_label = os.path.basename(pdb_file.name) if pdb_file else "Standard Reference Structure"
             report_df = pd.DataFrame(
                 [
                     ["Model Source", model_src_label],
@@ -381,7 +383,7 @@ def main():
             if scorecard.get("global_mae_n139", 0) == 0:
                 st.error("DATABASE CORRUPTED. RUN FULL DATASET RECOVERY.")
         else:
-            st.info("Run engine/scripts/vqe_n5_edge.py to generate artifacts.")
+            st.info("Run engine/vqe_n5_edge.py to generate artifacts.")
     if st.sidebar.button("Refresh Data", key="refresh_data"):
         st.cache_data.clear()
         st.cache_resource.clear()
