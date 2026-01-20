@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import py3Dmol
+import matplotlib.pyplot as plt
 
 from engine.run_state import (
     DEFAULT_TOLERANCES,
@@ -22,6 +23,7 @@ from engine.run_state import (
     feature_diff,
     parse_mutation_list,
 )
+from engine.radical_pair_yields import compute_yields, estimate_spike_metrics
 from engine.recommender import recommend, recommendation_to_row
 BASE_DIR = Path(os.getcwd())
 ARTIFACT_DIR = BASE_DIR / "artifacts" / "qc_n5_gpr"
@@ -64,6 +66,73 @@ def load_design_tokens():
     css = token_path.read_text() if token_path.exists() else ""
     theme_style = f"<style>{css}</style>"
     return theme_style
+
+
+@st.cache_data
+def cached_compute_yields(theta_deg, tau_us, kS, kT, omega, plane, Ax, Ay):
+    return compute_yields(theta_deg, tau_us=tau_us, kS=kS, kT=kT, omega=omega, plane=plane, Ax=Ax, Ay=Ay)
+
+
+def render_compass_simulator():
+    st.markdown("<div class='section-title'>Avian Compass Simulator</div>", unsafe_allow_html=True)
+    st.caption("Spin dynamics toy model; yields are dimensionless and not an Em predictor.")
+    plane = st.selectbox("Magnetic field plane", options=["ZX", "YZ"], index=0)
+    tau_us = st.slider("Lifetime τ (μs)", min_value=0.1, max_value=50.0, value=10.0, step=0.1)
+    rate_mode = st.selectbox("Reaction rates", options=["Equal rates (kS = kT = 1/τ)", "Separate kS and kT"])
+    kS_val = None
+    kT_val = None
+    if rate_mode != "Equal rates (kS = kT = 1/τ)":
+        kS_val = st.slider("kS (1/μs)", min_value=0.001, max_value=5.0, value=0.1, step=0.001)
+        kT_val = st.slider("kT (1/μs)", min_value=0.001, max_value=5.0, value=0.1, step=0.001)
+    omega = st.slider("Zeeman scale ω (scaled units)", min_value=0.0, max_value=2.0, value=0.1, step=0.01)
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.markdown("**FAD-like hyperfine (Ax, Ay, Az)**")
+        Ax_x = st.number_input("Axx (FAD-like)", value=-0.2, format="%.3f")
+        Ax_y = st.number_input("Ayy (FAD-like)", value=-0.2, format="%.3f")
+        Ax_z = st.number_input("Azz (FAD-like)", value=1.75, format="%.3f")
+    with col_b:
+        st.markdown("**Partner-like hyperfine (Ax, Ay, Az)**")
+        Ay_x = st.number_input("Axx (Partner-like)", value=0.0, format="%.3f")
+        Ay_y = st.number_input("Ayy (Partner-like)", value=0.0, format="%.3f")
+        Ay_z = st.number_input("Azz (Partner-like)", value=1.08, format="%.3f")
+    theta_min = st.number_input("θ min (deg)", value=0.0, format="%.1f")
+    theta_max = st.number_input("θ max (deg)", value=180.0, format="%.1f")
+    theta_pts = st.slider("Number of θ points", min_value=10, max_value=720, value=181, step=1)
+    run_sim = st.button("Run simulation", key="run_compass")
+    if run_sim:
+        theta_arr = np.linspace(theta_min, theta_max, int(theta_pts))
+        res = cached_compute_yields(theta_arr, tau_us, kS_val, kT_val, omega, plane, (Ax_x, Ax_y, Ax_z), (Ay_x, Ay_y, Ay_z))
+        st.session_state["compass_res"] = res
+    res = st.session_state.get("compass_res")
+    if res:
+        theta_arr = res["theta_deg"]
+        phi_s = res["phi_s"]
+        phi_t = res["phi_t"]
+        phi_sum = res["phi_sum"]
+        spike = estimate_spike_metrics(theta_arr, phi_s)
+        max_err = float(np.max(np.abs(phi_sum - 1.0)))
+        fig1, ax1 = plt.subplots()
+        ax1.plot(theta_arr, phi_s, label="ΦS")
+        ax1.plot(theta_arr, phi_t, label="ΦT")
+        ax1.set_xlabel("θ (deg)")
+        ax1.set_ylabel("Yield")
+        ax1.legend()
+        st.pyplot(fig1)
+        fig2, ax2 = plt.subplots()
+        ax2.plot(theta_arr, phi_s - np.mean(phi_s), label="ΦS - mean(ΦS)")
+        ax2.axhline(0, color="gray", linestyle="--", linewidth=0.8)
+        ax2.set_xlabel("θ (deg)")
+        ax2.set_ylabel("Anisotropic part")
+        ax2.legend()
+        st.pyplot(fig2)
+        st.write(
+            f"Spike amplitude: {spike['spike_amp']:.4f}; "
+            f"θ at max: {spike['theta_at_max']:.1f}°, θ at min: {spike['theta_at_min']:.1f}°; "
+            f"max|ΦS+ΦT-1|: {max_err:.2e}"
+        )
+        csv_df = pd.DataFrame({"theta_deg": res["theta_deg"], "phi_s": phi_s, "phi_t": phi_t, "phi_sum": phi_sum})
+        st.download_button("Download CSV", data=csv_df.to_csv(index=False), file_name="avian_compass_yields.csv", mime="text/csv")
 
 
 def render_metric_card(title, value, unit, interpretation, delta=None, delta_dir=None, badge=None):
@@ -181,6 +250,7 @@ def main():
     )
     st.markdown("<div class='header-title'>FLAVIN-OPT: Quantum-Driven Protein Brightness Lab</div>", unsafe_allow_html=True)
     st.markdown("<div class='header-sub'>OOK: Quantum-Driven Protein Engineering Suite v1.0</div>", unsafe_allow_html=True)
+    page = st.sidebar.radio("View", ["Quantum Profile", "Avian Compass Simulator"], index=0)
     st.sidebar.markdown("### About")
     st.sidebar.info("OOK combines 16-qubit VQE with Generalized Quantum Field Perturbation to predict flavin brightness and guide protein engineering.")
     COFACTOR_CHOICES = ["FAD", "FMN"]
@@ -200,7 +270,7 @@ def main():
     if scorecard and scorecard.get("global_mae_n139", 0) == 0:
         st.error("Database reset detected. Please rerun the full dataset or refresh to repopulate metrics.")
 
-    uniprot_id = st.text_input("Enter UniProt ID (required):", value="").strip().upper()
+    uniprot_id = st.text_input("Enter UniProt ID (optional):", value="").strip().upper()
     pdb_input = st.text_input("Enter PDB ID (optional, e.g., 1CF3):", value="").strip()
     pdb_file = st.file_uploader("Upload a .pdb file", type=["pdb"])
     pdb_text, pdb_id = None, None
@@ -229,14 +299,18 @@ def main():
             tmp.write(pdb_file.getvalue())
             st.session_state["recs_pdb_path"] = tmp.name
 
+    if page == "Avian Compass Simulator":
+        render_compass_simulator()
+        return
+
     # Run button gated analysis
     run_clicked = st.button("[ RUN QUANTUM ANALYSIS ]")
     analysis_ready = False
     fresh_row = None
     manifest_run_key = None
     if run_clicked:
-        if (pdb_file is None and not pdb_input) or not uniprot_id:
-            st.error("Provide UniProt ID and a PDB upload or ID before running analysis.")
+        if (pdb_file is None and not pdb_input):
+            st.error("Provide a PDB upload or ID before running analysis.")
             return
         if not cofactor_choice:
             st.error("Select a cofactor (FAD or FMN) before running.")
@@ -490,6 +564,7 @@ def main():
                     f"{brightness:.2f}" if pd.notna(brightness) else "NA",
                     "a.u.",
                     "Primary quantum brightness estimator",
+                    badge="heuristic",
                     delta=brightness_delta,
                     delta_dir=(1 if (brightness_delta or 0) > 0 else -1) if brightness_delta is not None else None,
                 ),
@@ -562,14 +637,14 @@ def main():
             st.markdown("<div class='support-card'><div class='section-title'>Supporting Metrics</div>", unsafe_allow_html=True)
             with st.expander("Electronic descriptors", expanded=True):
                 redox_val = float(bulk_row.get("pred_final", float("nan")))
-                if not np.isfinite(redox_val):
-                    redox_display = "CALC_ERROR"
+                if not np.isfinite(redox_val) or abs(redox_val) < 20:
+                    redox_display = "proxy_only"
                 else:
                     redox_display = f"{redox_val:.3f}"
                 ed_df = pd.DataFrame(
                     [
-                        ["Hybrid_Pred_Em (mV)", redox_display, "mV"],
-                        ["GPR_Pred_Em (mV)", float(bulk_row.get("gpr_pred", float("nan"))), "mV"],
+                        ["Em proxy (uncalibrated)", redox_display, "proxy"],
+                        ["Predicted Em (mV)", float(bulk_row.get("gpr_pred", float("nan"))), "mV"],
                         ["N5 spin density", n5_spin, "a.u."],
                         ["HFCC primary", primary_hfcc, "MHz"],
                         ["HFCC secondary", secondary_hfcc, "MHz"],
@@ -577,6 +652,7 @@ def main():
                     columns=["Metric", "Value", "Units"],
                 )
                 st.table(ed_df)
+                st.caption("Em proxy is a relative score; Predicted Em (mV) is the calibrated GPR output.")
             with st.expander("Structural quality", expanded=False):
                 struct_df = pd.DataFrame(
                     [
@@ -754,6 +830,62 @@ def main():
     if top5_path.exists():
         st.sidebar.markdown("**Top 5 H-Bond Stability**")
         st.sidebar.dataframe(pd.read_csv(top5_path))
+
+    st.markdown("<div class='section-title' style='margin-top:24px;'>Avian Compass Simulator</div>", unsafe_allow_html=True)
+    with st.expander("Avian Compass Simulator", expanded=False):
+        plane = st.selectbox("Magnetic field plane", options=["ZX", "YZ"], index=0)
+        tau_us = st.slider("Lifetime τ (μs)", min_value=0.1, max_value=50.0, value=10.0, step=0.1)
+        rate_mode = st.selectbox("Reaction rates", options=["Equal rates (kS = kT = 1/τ)", "Separate kS and kT"])
+        kS_val = None
+        kT_val = None
+        if rate_mode != "Equal rates (kS = kT = 1/τ)":
+            kS_val = st.slider("kS (1/μs)", min_value=0.001, max_value=5.0, value=0.1, step=0.001)
+            kT_val = st.slider("kT (1/μs)", min_value=0.001, max_value=5.0, value=0.1, step=0.001)
+        omega = st.slider("Zeeman scale ω (scaled units)", min_value=0.0, max_value=2.0, value=0.1, step=0.01)
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.markdown("**FAD-like hyperfine (Ax, Ay, Az)**")
+            Ax_x = st.number_input("Axx (FAD-like)", value=-0.2, format="%.3f")
+            Ax_y = st.number_input("Ayy (FAD-like)", value=-0.2, format="%.3f")
+            Ax_z = st.number_input("Azz (FAD-like)", value=1.75, format="%.3f")
+        with col_b:
+            st.markdown("**Partner-like hyperfine (Ax, Ay, Az)**")
+            Ay_x = st.number_input("Axx (Partner-like)", value=0.0, format="%.3f")
+            Ay_y = st.number_input("Ayy (Partner-like)", value=0.0, format="%.3f")
+            Ay_z = st.number_input("Azz (Partner-like)", value=1.08, format="%.3f")
+        theta_min = st.number_input("θ min (deg)", value=0.0, format="%.1f")
+        theta_max = st.number_input("θ max (deg)", value=180.0, format="%.1f")
+        theta_pts = st.slider("Number of θ points", min_value=10, max_value=720, value=181, step=1)
+        run_sim = st.button("Run simulation", key="run_compass")
+        if run_sim:
+            theta_arr = np.linspace(theta_min, theta_max, int(theta_pts))
+            res = cached_compute_yields(theta_arr, tau_us, kS_val, kT_val, omega, plane, (Ax_x, Ax_y, Ax_z), (Ay_x, Ay_y, Ay_z))
+            phi_s = res["phi_s"]
+            phi_t = res["phi_t"]
+            phi_sum = res["phi_sum"]
+            spike = estimate_spike_metrics(theta_arr, phi_s)
+            max_err = float(np.max(np.abs(phi_sum - 1.0)))
+            fig1, ax1 = plt.subplots()
+            ax1.plot(theta_arr, phi_s, label="ΦS")
+            ax1.plot(theta_arr, phi_t, label="ΦT")
+            ax1.set_xlabel("θ (deg)")
+            ax1.set_ylabel("Yield")
+            ax1.legend()
+            st.pyplot(fig1)
+            fig2, ax2 = plt.subplots()
+            ax2.plot(theta_arr, phi_s - np.mean(phi_s), label="ΦS - mean(ΦS)")
+            ax2.axhline(0, color="gray", linestyle="--", linewidth=0.8)
+            ax2.set_xlabel("θ (deg)")
+            ax2.set_ylabel("Anisotropic part")
+            ax2.legend()
+            st.pyplot(fig2)
+            st.write(
+                f"Spike amplitude: {spike['spike_amp']:.4f}; "
+                f"θ at max: {spike['theta_at_max']:.1f}°, θ at min: {spike['theta_at_min']:.1f}°; "
+                f"max|ΦS+ΦT-1|: {max_err:.2e}"
+            )
+            csv_df = pd.DataFrame({"theta_deg": res["theta_deg"], "phi_s": phi_s, "phi_t": phi_t, "phi_sum": phi_sum})
+            st.download_button("Download CSV", data=csv_df.to_csv(index=False), file_name="avian_compass_yields.csv", mime="text/csv")
 
 if __name__ == "__main__":
     main()

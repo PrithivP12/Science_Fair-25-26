@@ -1791,6 +1791,14 @@ def main(args: argparse.Namespace) -> None:
     res_df["pdb_id"] = res_df.apply(rename_with_mut, axis=1)
     q_profile["pdb_id"] = res_df["pdb_id"].values
 
+    prediction_path = Path(__file__).resolve().parent.parent / "data" / "prediction_redox_dataset.csv"
+    prediction_cols = list(q_profile.columns)
+    # append predictions to separate dataset (do not touch training data)
+    try:
+        atomic_write_csv(q_profile, prediction_path, append=True, expected_columns=prediction_cols)
+    except Exception as exc:
+        print(f"WARNING: failed to write prediction dataset ({exc})")
+
     if single_mode:
         # safe append: load existing and concat, never overwrite bulk results
         if bulk_path.exists():
