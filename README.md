@@ -5,7 +5,7 @@ A hybrid quantum-classical pipeline utilizing 16-qubit VQE and Generalized Quant
 ## Quick Start
 1. git clone https://github.com/PrithivP12/Science_Fair-25-26.git
 2. pip install -r requirements.txt
-3. streamlit run app.py
+3. python3 -m streamlit run app.py
 4. (Optional) Run the hybrid GPR+VQE pipeline on the bundled dataset: `python3 engine/vqe_n5_edge.py --data data/redox_dataset.csv`
 
 ## Troubleshooting
