@@ -10,3 +10,9 @@ A hybrid quantum-classical pipeline utilizing 16-qubit VQE and Generalized Quant
 
 ## Troubleshooting
 - If VQE returns 0.0, ensure your PDB file contains a valid HETATM record for FMN/FAD.
+
+## UI / Reporting Notes
+- Design tokens live in `design_tokens.css` (colors, typography, spacing). Add new tokens there, then reference via CSS variables in `app.py`.
+- To add a new metric to the dashboard, populate it in `engine/vqe_n5_edge.py` outputs and surface it in the Primary/Supporting sections in `app.py`.
+- Mark metrics as fixed/heuristic by adding a badge in the metric card text (e.g., “(fixed reference)” or “(heuristic)” next to the label).
+- WT vs mutant comparisons are driven by the canonical mutation key; ensure the WT profile is present to enable deltas. The “Compare to WT” toggle controls delta visibility.

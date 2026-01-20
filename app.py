@@ -2,9 +2,11 @@ import io
 import json
 import os
 import sys
+import hashlib
 import subprocess
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +14,15 @@ import pandas as pd
 import streamlit as st
 import py3Dmol
 
+from engine.run_state import (
+    DEFAULT_TOLERANCES,
+    canonical_mutation_key,
+    crossing_message,
+    detect_st_crossing,
+    feature_diff,
+    parse_mutation_list,
+)
+from engine.recommender import recommend, recommendation_to_row
 BASE_DIR = Path(os.getcwd())
 ARTIFACT_DIR = BASE_DIR / "artifacts" / "qc_n5_gpr"
 BULK_RESULTS = ARTIFACT_DIR / "bulk_quantum_results.csv"
@@ -19,6 +30,9 @@ QUANTUM_PROFILES = ARTIFACT_DIR / "Final_Quantum_Profiles.csv"
 SCORECARD = ARTIFACT_DIR / "Final_Project_Scorecard.json"
 FAILURE_10 = {"1CF3","1IJH","4MJW","1UMK","1NG4","1VAO","2GMJ","1E0Y","5K9B","1HUV"}
 CRITICAL_ST_GAP = 0.01
+EMISSION_TOL = DEFAULT_TOLERANCES.tol_emission
+FEATURE_REL_TOL = DEFAULT_TOLERANCES.tol_feature_rel
+FEATURE_ABS_TOL = DEFAULT_TOLERANCES.tol_feature_abs
 AA_PROPERTIES = {
     "A": {"e_neg": 0.0, "steric_index": 0.5},
     "R": {"e_neg": 0.2, "steric_index": 1.2},
@@ -42,10 +56,56 @@ AA_PROPERTIES = {
     "V": {"e_neg": 0.05, "steric_index": 0.9},
 }
 
+st.set_page_config(page_title="OOK Quantum Profile", layout="wide")
+
+
+def load_design_tokens():
+    token_path = BASE_DIR / "design_tokens.css"
+    css = token_path.read_text() if token_path.exists() else ""
+    theme_style = f"<style>{css}</style>"
+    return theme_style
+
+
+def render_metric_card(title, value, unit, interpretation, delta=None, delta_dir=None, badge=None):
+    delta_html = ""
+    if delta is not None and delta_dir:
+        arrow = "↑" if delta_dir > 0 else "↓"
+        delta_html = f"<div class='delta-pill'>{arrow} {delta:.3f} {unit}</div>"
+    badge_html = f"<span class='badge badge-info'>{badge}</span>" if badge else ""
+    return f"""
+    <div class="metric-card">
+        <h4>{title} {badge_html}</h4>
+        <div class="metric-value">{value}<span class="metric-unit">{unit}</span></div>
+        <div style="color:var(--text-dim);margin:6px 0 4px 0;">{interpretation}</div>
+        {delta_html}
+    </div>
+    """
+
+
+def render_tag_list(tags):
+    if not tags:
+        return "<span class='tag-pill'>WT</span>"
+    return "".join([f"<span class='tag-pill'>{t}</span>" for t in tags])
+
+def _safe_read_csv(path: Path) -> pd.DataFrame:
+    """Resilient CSV loader that tolerates malformed lines."""
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        # Prefer tolerant read first to avoid noisy warnings on imperfect logs.
+        df = pd.read_csv(path, on_bad_lines="skip", engine="python")
+        if df.empty:
+            st.info(f"{path.name} loaded but empty after skipping malformed lines.")
+        return df
+    except Exception as exc:
+        st.warning(f"Unable to read {path.name} even with tolerant parser ({exc}). Returning empty table.")
+        return pd.DataFrame()
+
+
 @st.cache_data
 def load_data(_reload_token: int = 0):
-    bulk = pd.read_csv(BULK_RESULTS) if BULK_RESULTS.exists() else pd.DataFrame()
-    qprof = pd.read_csv(QUANTUM_PROFILES) if QUANTUM_PROFILES.exists() else pd.DataFrame()
+    bulk = _safe_read_csv(BULK_RESULTS)
+    qprof = _safe_read_csv(QUANTUM_PROFILES)
     if not qprof.empty and "pdb_id" in qprof:
         qprof["PDB_ID"] = qprof["pdb_id"].astype(str).str.upper()
         qprof = qprof.drop_duplicates(subset=["PDB_ID"], keep="last")
@@ -92,44 +152,62 @@ def render_structure(pdb_id, pdb_text):
 
 def main():
     check_directories()
+    st.markdown(load_design_tokens(), unsafe_allow_html=True)
     st.markdown(
         """
         <style>
-        /* Terminal-style theme */
-        .metric-container {
-            background: #0f1115;
-            color: #e0e0e0;
-            border: 1px solid #222831;
-            border-radius: 6px;
-            padding: 8px;
+        body, .stApp { font-family: var(--font-sans); background: #0a0a0a !important; color: #f5f5f5 !important; }
+        .block-container { padding-top: 10px; background: #0a0a0a !important; }
+        .figure-card, .support-card, .run-bar, .stDataFrame, .stTable { background: #111111 !important; color: #f5f5f5 !important; border: 1px solid #2a2a2a; }
+        table { color: #f5f5f5 !important; }
+        .stDownloadButton button, button[kind=secondary], button[kind=primary], .stButton>button {
+            background: #ffffff !important;
+            color: #111111 !important;
+            border: 1px solid #d0d0d0 !important;
+            box-shadow: 0 1px 4px rgba(0,0,0,0.25);
         }
-        .badge-valid, .badge-predictive, .badge-baseline {
-            font-family: "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-            padding: 2px 8px;
-            border-radius: 999px;
-            font-weight: 700;
-        }
-        .badge-valid {color:#fff;background:#28a745;}
-        .badge-predictive {color:#fff;background:#007bff;}
-        .badge-baseline {color:#000;background:#ffc107;}
+        .tag-pill, .criteria-box, .delta-pill { background: #1a1a1a !important; color: #f5f5f5 !important; border: 1px solid #2a2a2a; }
+        .metric-card { background: #0f0f0f !important; color: #f5f5f5 !important; border: 1px solid #2a2a2a; }
+        .metric-value { color: #ffffff !important; }
+        .section-title { color: #f5f5f5 !important; }
+        .caption-box { background: #0f0f0f !important; color: #dcdcdc !important; border-left: 3px solid #666; }
+        .header-title { font-family: var(--font-serif); font-size: 28px; margin-bottom: 4px; }
+        .header-sub { color: #cccccc; font-size: 14px; }
+        .table-caption { color: var(--text-dim); font-size: 12px; }
+        .download-buttons button { margin-right: 8px; }
         </style>
         """,
         unsafe_allow_html=True,
     )
-    st.title("FLAVIN-OPT: Quantum-Driven Protein Brightness Lab")
-    st.header("OOK: Quantum-Driven Protein Engineering Suite v1.0")
+    st.markdown("<div class='header-title'>FLAVIN-OPT: Quantum-Driven Protein Brightness Lab</div>", unsafe_allow_html=True)
+    st.markdown("<div class='header-sub'>OOK: Quantum-Driven Protein Engineering Suite v1.0</div>", unsafe_allow_html=True)
     st.sidebar.markdown("### About")
     st.sidebar.info("OOK combines 16-qubit VQE with Generalized Quantum Field Perturbation to predict flavin brightness and guide protein engineering.")
+    COFACTOR_CHOICES = ["FAD", "FMN"]
+    cofactor_choice = st.sidebar.selectbox(
+        "Cofactor Configuration (required)",
+        options=[""] + COFACTOR_CHOICES,
+        format_func=lambda x: x if x else "Select...",
+    )
+    force_cofactor = st.sidebar.checkbox(
+        "Force run if cofactor not found in PDB",
+        value=False,
+        help="If unchecked, runs will fail when the selected cofactor residue is missing.",
+    )
     reload_token = st.session_state.get("reload_token", 0)
     bulk, qprof, scorecard = load_data(reload_token)
     # Keep idle until user triggers run
     if scorecard and scorecard.get("global_mae_n139", 0) == 0:
         st.error("Database reset detected. Please rerun the full dataset or refresh to repopulate metrics.")
 
+    uniprot_id = st.text_input("Enter UniProt ID (required):", value="").strip().upper()
     pdb_input = st.text_input("Enter PDB ID (optional, e.g., 1CF3):", value="").strip()
     pdb_file = st.file_uploader("Upload a .pdb file", type=["pdb"])
     pdb_text, pdb_id = None, None
     mutation_list_str = st.text_input("Enter Mutation List (e.g., C412A, W399F, F37S)", value="")
+    st.session_state["mutation_list"] = mutation_list_str
+    mutation_specs, _ = parse_mutation_list(mutation_list_str, default_chain="A")
+    mutation_key = canonical_mutation_key(mutation_specs)
     if pdb_file is not None:
         pdb_text = pdb_file.getvalue().decode("utf-8")
         for line in pdb_text.splitlines():
@@ -141,17 +219,29 @@ def main():
         st.info("Initiating 16-qubit VQE analysis for uploaded structure...")
     elif pdb_input:
         pdb_id = pdb_input
+    # Persist a temp PDB path for downstream recommender use
+    if pdb_text:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdb") as tmp:
+            tmp.write(pdb_text.encode("utf-8") if isinstance(pdb_text, str) else pdb_text)
+            st.session_state["recs_pdb_path"] = tmp.name
+    elif pdb_file is not None:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdb") as tmp:
+            tmp.write(pdb_file.getvalue())
+            st.session_state["recs_pdb_path"] = tmp.name
 
     # Run button gated analysis
     run_clicked = st.button("[ RUN QUANTUM ANALYSIS ]")
     analysis_ready = False
     fresh_row = None
+    manifest_run_key = None
     if run_clicked:
-        # force cache clear on each run with potential new mutation
-        st.cache_data.clear()
-        if pdb_file is None and not pdb_input:
-            st.error("Provide a PDB upload or ID before running analysis.")
+        if (pdb_file is None and not pdb_input) or not uniprot_id:
+            st.error("Provide UniProt ID and a PDB upload or ID before running analysis.")
             return
+        if not cofactor_choice:
+            st.error("Select a cofactor (FAD or FMN) before running.")
+            return
+        st.cache_data.clear()
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdb") as tmp:
             if pdb_file is not None:
                 tmp.write(pdb_file.getvalue())
@@ -161,6 +251,9 @@ def main():
         cmd = [sys.executable, str(BASE_DIR / "engine" / "vqe_n5_edge.py")]
         env = os.environ.copy()
         env["MUTATION_LIST"] = mutation_list_str or ""
+        env["COFACTOR_SELECTED"] = cofactor_choice
+        env["COFACTOR_FORCE"] = "1" if force_cofactor else "0"
+        env["UNIPROT_ID"] = uniprot_id
         if pdb_file is not None:
             cmd += ["--pdb", tmp_path]
         try:
@@ -172,20 +265,47 @@ def main():
         if proc.returncode != 0:
             err_msg = proc.stderr.strip() or proc.stdout.strip() or "Unknown error"
             st.error(f"VQE simulation failed: {err_msg}")
+            st.session_state["status"] = "Failed"
+            st.session_state["live_profile"] = None
             return
+        for line in proc.stdout.splitlines():
+            if line.startswith("RUN_MANIFEST:"):
+                try:
+                    manifest = json.loads(line.split("RUN_MANIFEST:", 1)[1])
+                    manifest_run_key = manifest.get("run_key")
+                except Exception:
+                    manifest_run_key = None
         st.cache_data.clear()
         st.session_state["reload_token"] = st.session_state.get("reload_token", 0) + 1
         bulk, qprof, scorecard = load_data(st.session_state["reload_token"])
         analysis_ready = True
-        # Grab the newest row directly for immediate display
-        if not qprof.empty:
+        # Grab the matching row by run_key if available
+        if manifest_run_key and not qprof.empty and "run_key" in qprof:
+            match = qprof[qprof["run_key"] == manifest_run_key]
+            if not match.empty:
+                fresh_row = match.iloc[0].copy()
+        # Fallback: match by pdb + mutation + cofactor selected
+        if fresh_row is None and not qprof.empty and pdb_id:
+            mutation_display_target = mutation_list_str or "WT"
+            cofactor_target = cofactor_choice.strip().upper() if cofactor_choice else ""
+            cand = qprof.copy()
+            cand["PDB_ID_UP"] = cand.get("PDB_ID", cand.get("pdb_id", "")).astype(str).str.upper()
+            cand = cand[cand["PDB_ID_UP"] == pdb_id.upper()]
+            if "mutation_display" in cand:
+                cand = cand[cand["mutation_display"].fillna("") == mutation_display_target]
+            if cofactor_target:
+                if "cofactor_type_used" in cand:
+                    cand = cand[cand["cofactor_type_used"].astype(str).str.upper() == cofactor_target]
+            if not cand.empty:
+                fresh_row = cand.tail(1).iloc[0].copy()
+        if fresh_row is None and not qprof.empty:
             fresh_row = qprof.tail(1).iloc[0].copy()
-            if pdb_id:
-                fresh_row["PDB_ID"] = pdb_id.upper()
-                fresh_row["pdb_id"] = pdb_id
+        if fresh_row is not None and pdb_id:
+            fresh_row["PDB_ID"] = pdb_id.upper()
+            fresh_row["pdb_id"] = pdb_id
         if fresh_row is not None:
             st.session_state["live_profile"] = dict(fresh_row)
-            mut_label = mutation_list_str.replace(",", "_").replace(" ", "") if mutation_list_str else "WT"
+            mut_label = mutation_key.replace(":", "") if mutation_key else "WT"
             live_id = f"{(pdb_id or fresh_row.get('pdb_id', '')).upper()}_{mut_label}"
             st.session_state["live_pdb"] = live_id
         st.success(f"ANALYSIS COMPLETE: Quantum Profile Generated for {pdb_id.upper() if pdb_id else 'NEW SAMPLE'}")
@@ -194,17 +314,22 @@ def main():
             st.sidebar.text("STATUS: Output logged to local artifacts folder.")
 
     if not analysis_ready:
-        st.info("[ STATUS: IDLE - AWAITING PROTEIN DATA ]")
-        return
+        # allow reuse of previous analysis for downstream tools
+        if st.session_state.get("live_profile"):
+            q_row = pd.Series(st.session_state["live_profile"])
+            pdb_id = st.session_state.get("live_pdb", "").split("_")[0]
+            analysis_ready = True
+        else:
+            st.info("[ STATUS: IDLE - AWAITING PROTEIN DATA ]")
+            return
 
     if pdb_id:
         pdb_id_upper = pdb_id.upper()
         if mutation_list_str and st.session_state.get("last_mut_str") != mutation_list_str:
             st.cache_data.clear()
         st.session_state["last_mut_str"] = mutation_list_str
-        mut_label = mutation_list_str.replace(",", "_").replace(" ", "") if mutation_list_str else "WT"
+        mut_label = mutation_key.replace(":", "") if mutation_key else "WT"
         save_id = f"{pdb_id_upper}_{mut_label}"
-        st.markdown(f"### Selected PDB: `{pdb_id}` ({mut_label})")
         target_id = save_id
         q_row = None
         bulk_row = None
@@ -214,18 +339,24 @@ def main():
         else:
             bulk_row, q_row = get_entry(target_id, bulk, qprof)
         if q_row is None or (isinstance(q_row, pd.Series) and q_row.empty):
-            # Fallback to most recent live profile
+        # Fallback to most recent live profile
             if st.session_state.get("live_profile"):
                 q_row = pd.Series(st.session_state["live_profile"])
             else:
                 st.info("[ STATUS: IDLE - Awaiting protein data ]")
                 return
+        mutation_display = q_row.get("mutation_display") or (mutation_list_str or "WT")
+        mut_label_display = str(mutation_display).replace(" ", "").replace(",", "_")
+        st.markdown(f"### Selected PDB: `{pdb_id}` ({mutation_display})")
         if bulk_row is None and not bulk.empty:
             bulk_row = bulk.tail(1).iloc[0]
+        base_id = f"{pdb_id_upper}_WT"
+        wt_row_df = qprof[qprof["PDB_ID"] == base_id].head(1)
+        wt_row = wt_row_df.iloc[0] if not wt_row_df.empty else None
         # Persist back to CSV if missing
         if save_id not in qprof.get("PDB_ID", pd.Series(dtype=str)).astype(str).str.upper().tolist():
             append_path = QUANTUM_PROFILES
-            q_append = pd.read_csv(append_path) if append_path.exists() else pd.DataFrame()
+            q_append = _safe_read_csv(append_path)
             q_row = q_row.copy()
             q_row["PDB_ID"] = save_id
             new_row = pd.DataFrame([q_row])
@@ -234,13 +365,42 @@ def main():
             st.cache_data.clear()
             st.sidebar.text(f"[ SUCCESS: QUANTUM PROFILE GENERATED FOR {save_id} ]")
 
+        cofactor_used = str(
+            q_row.get("cofactor_type_used")
+            or q_row.get("user_cofactor_choice")
+            or cofactor_choice
+            or ""
+        ).strip().upper()
+        detected_cofactor = str(q_row.get("cofactor_detected") or q_row.get("detected_cofactor") or "").strip().upper()
+        if cofactor_used == "AUTO" or not cofactor_used:
+            cofactor_used = detected_cofactor or str(cofactor_choice).strip().upper() or "UNKNOWN"
+        geometry_check_passed = bool(q_row.get("geometry_check_passed", True))
+        computational_mode_label = q_row.get("computational_mode") or q_row.get("cofactor_mode") or ""
+        # UniProt-based override for mode
+        cry_ids = {"P26484", "Q9VBW3"}
+        if uniprot_id and (uniprot_id in cry_ids or uniprot_id.startswith("CRY")):
+            computational_mode_label = "Radical Pair (Cryptochrome)"
+        cofactor_choice_upper = (cofactor_choice or "").upper()
+        if cofactor_choice_upper == "FAD" and detected_cofactor == "FMN":
+            st.warning("User override active: FAD selected but FMN-like geometry detected in PDB.")
+        if cofactor_choice_upper in {"FAD", "FMN"} and not geometry_check_passed:
+            st.warning(f"Geometry Check failed: {cofactor_choice_upper} not found in uploaded PDB.")
+        if not cofactor_used:
+            cofactor_used = detected_cofactor or "UNKNOWN"
+
         st_gap = float(q_row.get("st_gap", float("nan")))
         n5_spin = float(q_row.get("n5_spin_density", float("nan")))
         precision = 1.0 / (st_gap + 1e-6) if pd.notna(st_gap) else float("nan")
         scs = float(q_row.get("scs", 50.0))
+        st_crossing_flag = bool(q_row.get("st_crossing_detected", False))
+        if (not st_crossing_flag) and pd.notna(st_gap) and pd.notna(n5_spin):
+            st_crossing_flag = detect_st_crossing(st_gap, n5_spin, CRITICAL_ST_GAP, 0.4)
         triad = float(q_row.get("triad_score", float("nan")))
         clash_pen = float(q_row.get("clash_penalty", float("nan")))
         plddt = float(q_row.get("plddt_mean", float("nan")))
+        coupling_label = q_row.get("coupling_label", "COUPLING: UNKNOWN (insufficient data)")
+        primary_hfcc = float(q_row.get("hfcc_primary_mhz", float("nan")))
+        secondary_hfcc = float(q_row.get("hfcc_secondary_mhz", float("nan")))
         # Apply mutation list influence to ST gap for fluorescence proxy (wild-type if empty)
         # GQFP baseline and shifts
         base_st_gap_ev = 0.35
@@ -259,120 +419,304 @@ def main():
         st_gap_ev = max(st_gap_ev, 0.01)  # quench limit
         brightness = (st_gap_ev / base_st_gap_ev) * 150.0 if pd.notna(st_gap_ev) else float("nan")
 
-        # Confidence badge (instrument-style tags)
-        if scs > 85:
-            badge = "<span class='badge-valid'>[ VALIDATED ]</span>"
-        elif scs >= 60:
-            badge = "<span class='badge-predictive'>[ PREDICTIVE ]</span>"
-        else:
-            badge = "<span class='badge-baseline'>[ BASELINE ONLY ]</span>"
-        st.markdown(f"### Confidence {badge} &nbsp; SCS {scs:.1f}/100", unsafe_allow_html=True)
+        # Journal-style layout starts here
+        feature_hash_val = q_row.get("feature_hash", "") or ""
+        run_key_val = q_row.get("run_key", "") or ""
+        mutation_display = q_row.get("mutation_display") or (mutation_list_str or "WT")
+        mut_label_display = str(mutation_display).replace(" ", "").replace(",", "_")
+        run_status = "Complete" if analysis_ready else "Running"
+        run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        profile_id = f"{pdb_id_upper}_{mut_label_display}"
+        st.markdown(
+            f"""
+            <div class="run-bar">
+              <div><strong>Status:</strong> {run_status}</div>
+              <div><strong>Profile ID:</strong> {profile_id}</div>
+              <div><strong>Run Key:</strong> {run_key_val or 'NA'}</div>
+              <div><strong>Timestamp:</strong> {run_time}</div>
+              <div><strong>Feature Hash:</strong> {feature_hash_val or 'NA'}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        json_payload = q_row.to_json()
+        csv_payload = q_row.to_csv()
+        citation_text = f"OOK Quantum Profile for {profile_id} (run_key={run_key_val}) retrieved {run_time}."
+        dl_col1, dl_col2, dl_col3 = st.columns([1, 1, 1])
+        with dl_col1:
+            st.download_button("Download JSON", data=json_payload, file_name=f"{profile_id}.json", mime="application/json")
+        with dl_col2:
+            st.download_button("Download CSV", data=csv_payload, file_name=f"{profile_id}.csv", mime="text/csv")
+        with dl_col3:
+            st.download_button("Copy citation text", data=citation_text, file_name=f"{profile_id}_citation.txt", mime="text/plain")
 
-        col1, col2, col3 = st.columns(3)
-        st_gap_label = f"{st_gap_ev:.3f}" if pd.notna(st_gap_ev) else "N/A"
-        st_gap_sublabel = ""
-        if pd.notna(st_gap_ev):
-            if st_gap_ev > 0.50:
-                st_gap_sublabel = "CRYSTAL STABLE"
-            elif st_gap_ev < 0.20:
-                st_gap_sublabel = "QUANTUM LEAK DETECTED"
-        col1.metric("ST_Gap (eV)", st_gap_label, help=st_gap_sublabel or "Mutation-adjusted singlet-triplet gap (eV)")
-        col2.metric("N5 Spin Density", f"{n5_spin:.3f}" if pd.notna(n5_spin) else "N/A")
-        col3.metric("Pred_Em (mV)", f"{float(bulk_row.get('pred_final', float('nan'))):.2f}")
-        col4, col5, col6 = st.columns(3)
-        col4.metric("Triad Score", f"{triad:.0f}" if pd.notna(triad) else "N/A")
-        col5.metric("Clash Penalty", f"{clash_pen:.0f}" if pd.notna(clash_pen) else "N/A")
-        col6.metric("Mean pLDDT/B", f"{plddt:.1f}" if pd.notna(plddt) else "N/A")
+        compare_toggle = wt_row is not None and st.checkbox("Compare to WT", value=True, help="Toggle WT deltas where available.")
 
-        # Spin physics / HFCC
-        primary_hfcc = float(q_row.get("hfcc_primary_mhz", float("nan")))
-        secondary_hfcc = float(q_row.get("hfcc_secondary_mhz", float("nan")))
-        col7, col8, col9 = st.columns(3)
-        # Scale HFCC into realistic 10-35 MHz window
-        hfcc_axial = np.clip(primary_hfcc * 0.3, 10.0, 35.0) if pd.notna(primary_hfcc) else float("nan")
-        hfcc_secondary_scaled = np.clip(secondary_hfcc * 0.3, 10.0, 35.0) if pd.notna(secondary_hfcc) else float("nan")
-        col7.metric("Axial Hyperfine Coupling (MHz)", f"{hfcc_axial:.2f}" if pd.notna(hfcc_axial) else "N/A")
-        col8.metric("HFCC_N14_SECONDARY (MHz)", f"{hfcc_secondary_scaled:.2f}" if pd.notna(hfcc_secondary_scaled) else "N/A")
-        # Brightness color coding
-        bright_val = brightness if pd.notna(brightness) else None
-        if bright_val is not None:
-            if bright_val > 200:
-                bcolor = "#00FF00"
-            elif 140 <= bright_val <= 200:
-                bcolor = "#00CCFF"
-            elif 80 <= bright_val < 140:
-                bcolor = "#FFA500"
-            else:
-                bcolor = "#FF4B4B"
-            col9.markdown(
-                f"<div style='color:{bcolor};font-weight:700;'>Predicted Brightness: {bright_val:.2f}</div>",
+        left_col, right_col = st.columns([1.15, 0.85])
+        with left_col:
+            st.markdown(
+                f"""
+                <div class="figure-card">
+                    <div class="section-title">Primary Outputs</div>
+                  <div style="margin-bottom:12px;">
+                    <div style="font-family:var(--font-serif);font-size:20px;">{pdb_id_upper}</div>
+                    <div style="color:var(--text-dim);font-size:13px;">Cofactor: {cofactor_used or 'NA'}</div>
+                    <div style="margin-top:6px;">{render_tag_list([m.strip() for m in mutation_list_str.split(',') if m.strip()])}</div>
+                  </div>
+                  <div class="metric-grid">
+                """,
                 unsafe_allow_html=True,
             )
-        else:
-            col9.metric("Predicted Brightness", "N/A", help="Higher value indicates brighter fluorescence")
-
-        if pd.notna(primary_hfcc):
-            if primary_hfcc > 50.0:
-                st.info("[ HIGH COUPLING - SIGNAL STABLE ]")
-            elif primary_hfcc < 10.0:
-                st.warning("[ WEAK COUPLING - SIGNAL NOISE RISK ]")
-
-        if pd.notna(st_gap) and pd.notna(n5_spin) and (st_gap < CRITICAL_ST_GAP) and (n5_spin > 0.4):
-            st.info(
-                "**ELECTRONIC SINGLET-TRIPLET CROSSING DETECTED**\n\n"
-                "Target coordinates within ±0.01 meV sensitivity threshold. "
-                "Geometry aligns with magnetoreceptive theoretical models."
-            )
-            if scs < 60:
-                st.warning("Warning: High magnetic sensitivity detected; structural quality below verification threshold.")
+            brightness_delta = None
+            st_gap_delta = None
+            scs_delta = None
+            if compare_toggle and wt_row is not None:
+                try:
+                    wt_brightness = float(wt_row.get("pred_final", float("nan")))
+                    brightness_delta = brightness - wt_brightness if pd.notna(brightness) and pd.notna(wt_brightness) else None
+                except Exception:
+                    brightness_delta = None
+                try:
+                    st_gap_delta = st_gap_ev - (float(wt_row.get("st_gap", float("nan"))) / 1000.0) if pd.notna(st_gap_ev) else None
+                except Exception:
+                    st_gap_delta = None
+                try:
+                    scs_delta = scs - float(wt_row.get("scs", float("nan")))
+                except Exception:
+                    scs_delta = None
+            cards = [
+                render_metric_card(
+                    "Predicted Brightness",
+                    f"{brightness:.2f}" if pd.notna(brightness) else "NA",
+                    "a.u.",
+                    "Primary quantum brightness estimator",
+                    delta=brightness_delta,
+                    delta_dir=(1 if (brightness_delta or 0) > 0 else -1) if brightness_delta is not None else None,
+                ),
+                render_metric_card(
+                    "ST Gap",
+                    f"{st_gap_ev:.3f}" if pd.notna(st_gap_ev) else "NA",
+                    "eV",
+                    "Mutation-adjusted singlet–triplet gap",
+                    delta=st_gap_delta,
+                    delta_dir=(1 if (st_gap_delta or 0) > 0 else -1) if st_gap_delta is not None else None,
+                ),
+                render_metric_card(
+                    "Confidence (SCS)",
+                    f"{scs:.1f}" if pd.notna(scs) else "NA",
+                    "/100",
+                    "Structural confidence score",
+                    delta=scs_delta,
+                    delta_dir=(1 if (scs_delta or 0) > 0 else -1) if scs_delta is not None else None,
+                ),
+            ]
+            st.markdown("".join(cards), unsafe_allow_html=True)
+            st.markdown("</div>", unsafe_allow_html=True)
+            st.markdown("<div class='section-title' style='margin-top:12px;'>Mutation Sensitivity Audit</div>", unsafe_allow_html=True)
+            audit_fields = [
+                "pred_final",
+                "st_gap",
+                "n5_spin_density",
+                "hfcc_primary_mhz",
+                "quantum_polarizability",
+                "Around_N5_HBondCap",
+                "Around_N5_Flexibility",
+            ]
+            if wt_row is not None:
+                diffs = feature_diff(wt_row.to_dict(), q_row.to_dict(), audit_fields, DEFAULT_TOLERANCES)
+                audit_df = pd.DataFrame(
+                    [
+                        {
+                            "Feature": d["feature"],
+                            "WT": d["wt"],
+                            "Mut": d["mut"],
+                            "Δ": d["delta"],
+                            "Changed?": d["changed"],
+                        }
+                        for d in diffs
+                    ]
+                )
+                styled = audit_df.style.apply(
+                    lambda s: ["background-color: var(--bg-muted)" if changed else "" for changed in s["Changed?"]]
+                    if "Changed?" in s
+                    else "",
+                    axis=1,
+                )
+                st.dataframe(styled, use_container_width=True, hide_index=True)
+                changed_count = audit_df["Changed?"].sum()
+                if changed_count == 0:
+                    st.warning("Mutation Sensitivity Audit: no feature-level change detected; verify mutation parsing.")
+                elif changed_count < len(audit_df) // 2:
+                    st.warning("High proportion of features unchanged; mutation sensitivity may be weak.")
+                if wt_row is not None and pd.notna(brightness) and pd.notna(wt_row.get("pred_final", float("nan"))):
+                    pred_delta = abs(float(brightness) - float(wt_row.get("pred_final", float("nan"))))
+                    if pred_delta < EMISSION_TOL:
+                        st.warning("Pred_Em unchanged (Δ < tol). Check coupling between mutation-derived features and emission predictor.")
             else:
-                st.info("Profile: Stable electronic regime; no singlet-triplet crossing detected.")
+                st.info("WT reference unavailable; audit shows mutant-only values.")
+            caption_text = f"Quantum profile for {pdb_id_upper} with mutations [{mutation_list_str or 'WT'}]. ST crossing criteria: gap<{CRITICAL_ST_GAP} eV and spin>0.4. Coupling: {coupling_label}."
+            st.markdown(f"<div class='caption-box'><strong>Figure caption:</strong> {caption_text}</div>", unsafe_allow_html=True)
+            st.markdown("</div>", unsafe_allow_html=True)
 
-            st.subheader("Structural Analysis Report")
-            triad_status = "NOT DETECTED"
-            comp_mode_val = "Generalized Quantum Field Perturbation (GQFP)" if mutation_list_str else ("Isolated_Cofactor_Sim" if triad_status == "NOT DETECTED" else "Protein-Embedded")
-            model_src_label = os.path.basename(pdb_file.name) if pdb_file else "Standard Reference Structure"
-            report_df = pd.DataFrame(
-                [
-                    ["Model Source", model_src_label],
-                    ["Residue Consistency", "PASS"],
-                    ["Tryptophan Triad", triad_status],
-                    ["Computational Mode", comp_mode_val],
-                ],
-                columns=["Field", "Value"],
-            )
-            st.table(report_df)
-
-            # Brightness enhancement alert vs baseline (wild type assumed in qprof if available)
-            base_id = f"{pdb_id_upper}_WT"
-            wt_row = qprof[qprof["PDB_ID"] == base_id].head(1)
-            if not wt_row.empty:
-                wt_gap = float(wt_row.iloc[0].get("st_gap", float("nan"))) / 1000.0
-                if pd.notna(wt_gap):
-                    wt_gap = max(wt_gap, 0.01)
-                    wt_brightness = (wt_gap / base_st_gap_ev) * 150.0
-                    if pd.notna(brightness):
-                        delta_brightness = 100.0 * (brightness - wt_brightness) / wt_brightness if wt_brightness != 0 else float("nan")
-                        st.metric("Delta Brightness (%)", f"{delta_brightness:.1f}" if pd.notna(delta_brightness) else "N/A")
-                        if pd.notna(delta_brightness) and delta_brightness > 20.0:
-                            st.warning("[ TARGET MUTATION IDENTIFIED: POTENTIAL BRIGHTNESS ENHANCEMENT ]")
-                        if mutation_list_str and pd.notna(st_gap_ev) and abs(st_gap_ev - wt_gap) < 1e-6:
-                            st.warning("[ SYSTEM ERROR: PHYSICS ENGINE NOT RESPONDING TO MUTATION ]")
-
-            st.subheader("Prediction")
-            st.json({
-                "Hybrid_Pred_Em (mV)": float(bulk_row.get("pred_final", float("nan"))),
-                "GPR_Pred_Em (mV)": float(bulk_row.get("gpr_pred", float("nan"))),
-                "Abs_Error_GPR": float(bulk_row.get("abs_err_gpr", float("nan"))),
-                "Abs_Error_Hybrid": float(bulk_row.get("abs_err_final", float("nan"))),
-            })
+        with right_col:
+            st.markdown("<div class='support-card'><div class='section-title'>Supporting Metrics</div>", unsafe_allow_html=True)
+            with st.expander("Electronic descriptors", expanded=True):
+                redox_val = float(bulk_row.get("pred_final", float("nan")))
+                if not np.isfinite(redox_val):
+                    redox_display = "CALC_ERROR"
+                else:
+                    redox_display = f"{redox_val:.3f}"
+                ed_df = pd.DataFrame(
+                    [
+                        ["Hybrid_Pred_Em (mV)", redox_display, "mV"],
+                        ["GPR_Pred_Em (mV)", float(bulk_row.get("gpr_pred", float("nan"))), "mV"],
+                        ["N5 spin density", n5_spin, "a.u."],
+                        ["HFCC primary", primary_hfcc, "MHz"],
+                        ["HFCC secondary", secondary_hfcc, "MHz"],
+                    ],
+                    columns=["Metric", "Value", "Units"],
+                )
+                st.table(ed_df)
+            with st.expander("Structural quality", expanded=False):
+                struct_df = pd.DataFrame(
+                    [
+                        ["Clash penalty", clash_pen, "a.u."],
+                        ["Mean pLDDT/B", plddt, ""],
+                        ["Residue consistency", "PASS", ""],
+                    ],
+                    columns=["Metric", "Value", "Units"],
+                ).astype(str)
+                st.table(struct_df)
+            with st.expander("Coupling & criteria", expanded=False):
+                criteria_text = f"ST crossing: gap<{CRITICAL_ST_GAP} eV and spin>0.4; coupling thresholds: hfcc>15 MHz"
+                coupling_df = pd.DataFrame(
+                    [
+                        ["Coupling label", coupling_label, ""],
+                        ["ST crossing detected", st_crossing_flag, ""],
+                        ["Computational mode", computational_mode_label, ""],
+                    ],
+                    columns=["Metric", "Value", "Units"],
+                ).astype(str)
+                st.table(coupling_df)
+                st.markdown(f"<div class='criteria-box'>{criteria_text}</div>", unsafe_allow_html=True)
+            with st.expander("3D Structure", expanded=False):
+                try:
+                    render_structure(pdb_id, pdb_text)
+                except Exception as exc:
+                    st.warning(f"3D view unavailable: {exc}")
+            st.markdown("</div>", unsafe_allow_html=True)
 
             with st.expander("Physics Audit"):
                 st.info("Instrument calibrated to PNAS 1600341113 theoretical avoided-crossing parameters. Units: ST_Gap in eV, HFCC in MHz.")
                 if "homo_lumo_gap" in q_row:
-                    st.write("Raw Hamiltonian eigenvalues (proxy):")
-                    eigvals = [v for v in [q_row.get("homo_lumo_gap"), q_row.get("st_gap")] if pd.notna(v)]
-                    st.json({"eigenvalues": eigvals})
+                    raw_vals = [q_row.get("homo_lumo_gap"), q_row.get("st_gap")]
+                    eigvals: list = []
+                    for v in raw_vals:
+                        try:
+                            fv = float(v)
+                            if np.isnan(fv) or np.isinf(fv):
+                                eigvals.append(None)
+                            else:
+                                eigvals.append(fv)
+                        except Exception:
+                            eigvals.append(None)
+                    payload = {"eigenvalues": eigvals}
+                    st.code(json.dumps(payload, indent=2), language="json")
+
+            with st.expander("Combinatorial Mutation Recommender", expanded=False):
+                if pdb_file is None and pdb_text is None:
+                    st.info("Upload a PDB to generate recommendations.")
+                else:
+                    rec_input_path = st.session_state.get("recs_pdb_path", None)
+                    if rec_input_path is None:
+                        st.warning("PDB not cached for recommendations; re-upload or re-run analysis.")
+                    if rec_input_path and not os.path.exists(rec_input_path) and pdb_file is not None:
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdb") as tmp_pdb:
+                            tmp_pdb.write(pdb_file.getvalue())
+                            rec_input_path = tmp_pdb.name
+                            st.session_state["recs_pdb_path"] = rec_input_path
+                    # Default search settings
+                    rec_radius = st.slider("Residue radius around cofactor (Å)", min_value=6.0, max_value=12.0, value=8.0, step=0.5)
+                    max_combo_size = st.select_slider("Max combo size", options=[2, 3, 4], value=3)
+                    beam_width = st.slider("Beam width", min_value=2, max_value=8, value=4, step=1)
+                    top_n = st.slider("Top N per category", min_value=3, max_value=10, value=5, step=1)
+                    do_not_mutate = st.text_input("Do not mutate (comma-separated residues, e.g., 50, A:75)", value="")
+                    if "recs_data" not in st.session_state:
+                        st.session_state["recs_data"] = None
+                        st.session_state["recs_status"] = "idle"
+
+                    if st.button("Compute Recommendations", key="compute_recs", disabled=not rec_input_path):
+                        exclude_list = [r.strip() for r in do_not_mutate.split(",") if r.strip()]
+                        try:
+                            st.session_state["recs_status"] = "running"
+                            with st.spinner("Computing mutation recommendations..."):
+                                recs = recommend(
+                                    pdb_path=rec_input_path,
+                                    cofactor_choice=cofactor_choice,
+                                    baseline_brightness=float(brightness) if pd.notna(brightness) else 0.0,
+                                    confidence=scs if pd.notna(scs) else 50.0,
+                                    radius=rec_radius,
+                                    max_combo_size=max_combo_size,
+                                    beam_width=beam_width,
+                                    top_n=top_n,
+                                    do_not_mutate=exclude_list,
+                                )
+                            st.session_state["recs_data"] = recs
+                            st.session_state["recs_status"] = "ready"
+                        except Exception as exc:
+                            st.session_state["recs_status"] = "error"
+                            st.error(f"Recommendation engine failed: {exc}")
+                    if st.session_state.get("recs_data"):
+                        recs = st.session_state["recs_data"]
+                        show_heuristic = st.checkbox("Show heuristic suggestions", value=False)
+                        for label in ("singles", "doubles", "triples"):
+                            rec_computed = [r for r in recs.get(label, []) if not getattr(r, "heuristic", False)]
+                            rec_heuristic = [r for r in recs.get(label, []) if getattr(r, "heuristic", False)]
+                            rec_list = rec_computed if rec_computed else (rec_heuristic if show_heuristic else [])
+                            if not rec_list:
+                                continue
+                            table = [recommendation_to_row(r) for r in rec_list]
+                            df_table = pd.DataFrame(table)
+                            visible_cols = ["Mutations", "PredBrightness", "DeltaBrightness", "Confidence", "ClashRisk", "StabilityRisk", "Notes"]
+                            df_visible = df_table[visible_cols].astype(str)
+                            tag = "computed" if rec_computed else "heuristic"
+                            st.markdown(f"**Top {label.capitalize()} ({tag})**")
+                            st.dataframe(df_visible, use_container_width=True)
+                            st.download_button(
+                                f"Download {label} (CSV)",
+                                data=df_visible.to_csv(index=False),
+                                file_name=f"{profile_id}_{label}_{tag}.csv",
+                                mime="text/csv",
+                                key=f"dl_{label}_{tag}",
+                            )
+                        if all(len([r for r in recs.get(label, []) if not getattr(r, "heuristic", False)]) == 0 for label in ("singles", "doubles", "triples")) and not show_heuristic:
+                            st.info("No computed recommendations available. Enable 'Show heuristic suggestions' to view heuristic candidates.")
+                        if st.session_state["recs_data"]:
+                            with st.expander("Show debug", expanded=False):
+                                for label in ("singles", "doubles", "triples"):
+                                    raw_list = recs.get(label, [])
+                                    if not raw_list:
+                                        continue
+                                    raw_df = pd.DataFrame([recommendation_to_row(r) for r in raw_list])
+                                    st.markdown(f"**Debug {label}**")
+                                    st.dataframe(raw_df, use_container_width=True)
+                        singles_list = [r for r in st.session_state["recs_data"].get("singles", []) if not getattr(r, "heuristic", False)]
+                        if singles_list:
+                            st.markdown("**Quick Picks (computed)**")
+                            bullets = []
+                            rank = 1
+                            for rec_block in ("singles", "doubles", "triples"):
+                                for rec in [r for r in st.session_state["recs_data"].get(rec_block, []) if not getattr(r, "heuristic", False)][:3]:
+                                    muts = ", ".join(m.canonical_token() for m in rec.mutations)
+                                    bullets.append(f"{rank}. {muts} → ΔBrightness: {rec.delta_brightness:.2f} (Pred: {rec.pred_brightness:.2f})")
+                                    rank += 1
+                            if bullets:
+                                st.markdown("\n".join([f"- {b}" for b in bullets]))
+                    else:
+                        if st.session_state.get("recs_status") == "running":
+                            st.info("Computing recommendations...")
+                        else:
+                            st.info("Press 'Compute Recommendations' to generate ranked mutations.")
 
             try:
                 render_structure(pdb_id, pdb_text)
