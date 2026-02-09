@@ -111,7 +111,7 @@ def test_recommended_residues_exist_in_structure():
     # build deterministic candidate list from actual structure keys
     candidates = []
     for (chain, resi, icode), rec in list(residue_index.items())[:3]:
-        candidates.append(recommender.Mutation(chain=chain, resseq=resi, icode=icode, wt=rec.resn[:1], mut="V"))
+        candidates.append(recommender.Mutation(chain=chain, resseq=resi, icode=icode, wt=recommender._resn_to_aa1(rec.resn), mut="V"))
     token_map = {m.canonical_token(): m for m in candidates}
     mp = pytest.MonkeyPatch()
     mp.setattr(recommender, "conservative_candidate_pool", lambda *args, **kwargs: candidates)
@@ -155,7 +155,7 @@ def test_recommended_residues_exist_in_structure():
                 pass
             rec_struct = residue_index.get((m.chain, m.resseq, m.icode)) or residue_index.get((m.chain, m.resseq, " "))
             if rec_struct:
-                assert rec_struct.resn[:1] == m.wt
+                assert recommender._resn_to_aa1(rec_struct.resn) == m.wt
 
 
 def test_run_key_includes_mutations_and_is_order_invariant():
@@ -236,7 +236,7 @@ def test_recommender_returns_nonconstant_brightness_on_fixture(monkeypatch):
     residue_index, _ = parse_pdb_structure(str(pdb_path))
     muts = []
     for (chain, resi, icode), rec in list(residue_index.items())[:3]:
-        muts.append(recommender.Mutation(chain=chain, resseq=resi, icode=icode, wt=rec.resn[:1], mut="V"))
+        muts.append(recommender.Mutation(chain=chain, resseq=resi, icode=icode, wt=recommender._resn_to_aa1(rec.resn), mut="V"))
     token_map = {m.canonical_token(): m for m in muts}
 
     def fake_predict(pdb_path, cofactor_choice, mutation_tokens, wt_feature_hash, wt_brightness, confidence, wt_run_key=None, wt_st_gap=None):
@@ -289,3 +289,11 @@ def test_recommender_returns_nonconstant_brightness_on_fixture(monkeypatch):
     assert len(singles) >= 1
     brightness_vals = {r.pred_brightness for r in singles}
     assert len(brightness_vals) > 1
+
+
+def test_recommender_residue_mapping_and_exclusions_are_precise():
+    assert recommender._resn_to_aa1("ASP") == "D"
+    assert recommender._resn_to_aa1("GLU") == "E"
+    excl_chain, excl_global = recommender._parse_exclusions(["10", "A:75"])
+    assert "10" in excl_global
+    assert ("A", "75") in excl_chain

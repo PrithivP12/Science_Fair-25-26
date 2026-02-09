@@ -24,12 +24,32 @@ from engine.run_state import (
     parse_mutation_list,
 )
 from engine.radical_pair_yields import compute_yields, estimate_spike_metrics
-from engine.recommender import recommend, recommendation_to_row
+from engine.recommender import recommend, recommendation_to_row, conservative_candidate_pool
+from engine.recommender_config import CONFIG as RECOMMENDER_CONFIG
 BASE_DIR = Path(os.getcwd())
 ARTIFACT_DIR = BASE_DIR / "artifacts" / "qc_n5_gpr"
 BULK_RESULTS = ARTIFACT_DIR / "bulk_quantum_results.csv"
 QUANTUM_PROFILES = ARTIFACT_DIR / "Final_Quantum_Profiles.csv"
 SCORECARD = ARTIFACT_DIR / "Final_Project_Scorecard.json"
+# Mean Em of bundled training set; used to detect "collapsed to mean" predictions.
+# Prefer the latest Excel dataset if present, otherwise fall back to legacy CSV,
+# and finally a static constant.
+def _load_train_mean_em():
+    excel_path = BASE_DIR / "data" / "Protein Dataset 10.3 (5).xlsx"
+    csv_path = BASE_DIR / "data" / "redox_dataset.csv"
+    if excel_path.exists():
+        try:
+            return float(pd.read_excel(excel_path, engine="openpyxl")["Em"].mean())
+        except Exception:
+            pass
+    if csv_path.exists():
+        try:
+            return float(pd.read_csv(csv_path)["Em"].mean())
+        except Exception:
+            pass
+    return -208.30234375
+
+_TRAIN_MEAN_EM = _load_train_mean_em()
 FAILURE_10 = {"1CF3","1IJH","4MJW","1UMK","1NG4","1VAO","2GMJ","1E0Y","5K9B","1HUV"}
 CRITICAL_ST_GAP = 0.01
 EMISSION_TOL = DEFAULT_TOLERANCES.tol_emission
@@ -58,7 +78,7 @@ AA_PROPERTIES = {
     "V": {"e_neg": 0.05, "steric_index": 0.9},
 }
 
-st.set_page_config(page_title="OOK Quantum Profile", layout="wide")
+st.set_page_config(page_title="FLAVIN-OPT Quantum Profile", layout="wide")
 
 
 def load_design_tokens():
@@ -171,6 +191,38 @@ def _safe_read_csv(path: Path) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def _safe_float(value) -> float:
+    try:
+        out = float(value)
+        return out if np.isfinite(out) else float("nan")
+    except Exception:
+        return float("nan")
+
+
+def _first_finite(*values) -> float:
+    for value in values:
+        out = _safe_float(value)
+        if np.isfinite(out):
+            return out
+    return float("nan")
+
+
+def _format_eta_seconds(seconds: float) -> str:
+    try:
+        total = int(round(float(seconds)))
+    except Exception:
+        return "unknown"
+    if total < 0:
+        return "unknown"
+    mins, sec = divmod(total, 60)
+    hrs, mins = divmod(mins, 60)
+    if hrs > 0:
+        return f"{hrs}h {mins}m {sec}s"
+    if mins > 0:
+        return f"{mins}m {sec}s"
+    return f"{sec}s"
+
+
 @st.cache_data
 def load_data(_reload_token: int = 0):
     bulk = _safe_read_csv(BULK_RESULTS)
@@ -249,10 +301,7 @@ def main():
         unsafe_allow_html=True,
     )
     st.markdown("<div class='header-title'>FLAVIN-OPT: Quantum-Driven Protein Brightness Lab</div>", unsafe_allow_html=True)
-    st.markdown("<div class='header-sub'>OOK: Quantum-Driven Protein Engineering Suite v1.0</div>", unsafe_allow_html=True)
     page = st.sidebar.radio("View", ["Quantum Profile", "Avian Compass Simulator"], index=0)
-    st.sidebar.markdown("### About")
-    st.sidebar.info("OOK combines 16-qubit VQE with Generalized Quantum Field Perturbation to predict flavin brightness and guide protein engineering.")
     COFACTOR_CHOICES = ["FAD", "FMN"]
     cofactor_choice = st.sidebar.selectbox(
         "Cofactor Configuration (required)",
@@ -272,30 +321,33 @@ def main():
 
     uniprot_id = st.text_input("Enter UniProt ID (optional):", value="").strip().upper()
     pdb_input = st.text_input("Enter PDB ID (optional, e.g., 1CF3):", value="").strip()
-    pdb_file = st.file_uploader("Upload a .pdb file", type=["pdb"])
+    pdb_file = st.file_uploader("Upload a .pdb or .ent file", type=["pdb", "ent"])
     pdb_text, pdb_id = None, None
     mutation_list_str = st.text_input("Enter Mutation List (e.g., C412A, W399F, F37S)", value="")
     st.session_state["mutation_list"] = mutation_list_str
     mutation_specs, _ = parse_mutation_list(mutation_list_str, default_chain="A")
     mutation_key = canonical_mutation_key(mutation_specs)
+    upload_suffix = ".pdb"
     if pdb_file is not None:
-        pdb_text = pdb_file.getvalue().decode("utf-8")
+        file_suffix = Path(pdb_file.name).suffix.lower()
+        if file_suffix in {".pdb", ".ent"}:
+            upload_suffix = file_suffix
+        pdb_text = pdb_file.getvalue().decode("utf-8", errors="ignore")
         for line in pdb_text.splitlines():
             if line.startswith("HEADER") and len(line) >= 66:
                 pdb_id = line[62:66].strip()
                 break
         if not pdb_id:
-            pdb_id = pdb_file.name.replace(".pdb", "")
-        st.info("Initiating 16-qubit VQE analysis for uploaded structure...")
+            pdb_id = Path(pdb_file.name).stem
     elif pdb_input:
         pdb_id = pdb_input
     # Persist a temp PDB path for downstream recommender use
     if pdb_text:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdb") as tmp:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=upload_suffix) as tmp:
             tmp.write(pdb_text.encode("utf-8") if isinstance(pdb_text, str) else pdb_text)
             st.session_state["recs_pdb_path"] = tmp.name
     elif pdb_file is not None:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdb") as tmp:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=upload_suffix) as tmp:
             tmp.write(pdb_file.getvalue())
             st.session_state["recs_pdb_path"] = tmp.name
 
@@ -304,7 +356,7 @@ def main():
         return
 
     # Run button gated analysis
-    run_clicked = st.button("[ RUN QUANTUM ANALYSIS ]")
+    run_clicked = st.button("[ RUN ANALYSIS ]")
     analysis_ready = False
     fresh_row = None
     manifest_run_key = None
@@ -316,24 +368,34 @@ def main():
             st.error("Select a cofactor (FAD or FMN) before running.")
             return
         st.cache_data.clear()
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdb") as tmp:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=upload_suffix) as tmp:
             if pdb_file is not None:
                 tmp.write(pdb_file.getvalue())
             tmp_path = tmp.name if pdb_file is not None else None
         prog = st.progress(0)
-        st.info("System Status: Running VQE/GPR analysis...")
         cmd = [sys.executable, str(BASE_DIR / "engine" / "vqe_n5_edge.py")]
         env = os.environ.copy()
         env["MUTATION_LIST"] = mutation_list_str or ""
         env["COFACTOR_SELECTED"] = cofactor_choice
         env["COFACTOR_FORCE"] = "1" if force_cofactor else "0"
         env["UNIPROT_ID"] = uniprot_id
+        if pdb_id:
+            env["PDB_LABEL"] = pdb_id
         if pdb_file is not None:
             cmd += ["--pdb", tmp_path]
+        # Configurable timeout: env VQE_TIMEOUT_SEC_UI (or VQE_TIMEOUT_SEC) controls limit; 0 disables timeout.
+        timeout_env = env.get("VQE_TIMEOUT_SEC_UI") or env.get("VQE_TIMEOUT_SEC") or ""
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60, env=env)
+            timeout_val = float(timeout_env) if timeout_env else 300.0
+            if timeout_val <= 0:
+                timeout_val = None
+        except ValueError:
+            timeout_val = 300.0
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_val, env=env)
         except subprocess.TimeoutExpired:
-            st.error("VQE simulation timed out.")
+            st.error(f"VQE simulation timed out after {timeout_val or 'unlimited'} seconds. "
+                     f"Raise VQE_TIMEOUT_SEC_UI or set to 0 for no limit (may hang).")
             return
         prog.progress(100)
         if proc.returncode != 0:
@@ -364,7 +426,8 @@ def main():
             cofactor_target = cofactor_choice.strip().upper() if cofactor_choice else ""
             cand = qprof.copy()
             cand["PDB_ID_UP"] = cand.get("PDB_ID", cand.get("pdb_id", "")).astype(str).str.upper()
-            cand = cand[cand["PDB_ID_UP"] == pdb_id.upper()]
+            pid_up = pdb_id.upper()
+            cand = cand[(cand["PDB_ID_UP"] == pid_up) | (cand["PDB_ID_UP"].str.startswith(f"{pid_up}_"))]
             if "mutation_display" in cand:
                 cand = cand[cand["mutation_display"].fillna("") == mutation_display_target]
             if cofactor_target:
@@ -422,11 +485,12 @@ def main():
         mutation_display = q_row.get("mutation_display") or (mutation_list_str or "WT")
         mut_label_display = str(mutation_display).replace(" ", "").replace(",", "_")
         st.markdown(f"### Selected PDB: `{pdb_id}` ({mutation_display})")
-        if bulk_row is None and not bulk.empty:
-            bulk_row = bulk.tail(1).iloc[0]
-        base_id = f"{pdb_id_upper}_WT"
-        wt_row_df = qprof[qprof["PDB_ID"] == base_id].head(1)
-        wt_row = wt_row_df.iloc[0] if not wt_row_df.empty else None
+        wt_candidates = {f"{pdb_id_upper}_WT", f"{pdb_id_upper}_WT_MUTATION"}
+        wt_mask = qprof["PDB_ID"].astype(str).str.upper().isin(wt_candidates)
+        wt_row_df = qprof[wt_mask]
+        if wt_row_df.empty:
+            wt_row_df = qprof[qprof["PDB_ID"].astype(str).str.upper().str.startswith(f"{pdb_id_upper}_WT")]
+        wt_row = wt_row_df.tail(1).iloc[0] if not wt_row_df.empty else None
         # Persist back to CSV if missing
         if save_id not in qprof.get("PDB_ID", pd.Series(dtype=str)).astype(str).str.upper().tolist():
             append_path = QUANTUM_PROFILES
@@ -515,7 +579,7 @@ def main():
         )
         json_payload = q_row.to_json()
         csv_payload = q_row.to_csv()
-        citation_text = f"OOK Quantum Profile for {profile_id} (run_key={run_key_val}) retrieved {run_time}."
+        citation_text = f"FLAVIN-OPT Quantum Profile for {profile_id} (run_key={run_key_val}) retrieved {run_time}."
         dl_col1, dl_col2, dl_col3 = st.columns([1, 1, 1])
         with dl_col1:
             st.download_button("Download JSON", data=json_payload, file_name=f"{profile_id}.json", mime="application/json")
@@ -612,9 +676,7 @@ def main():
                     ]
                 )
                 styled = audit_df.style.apply(
-                    lambda s: ["background-color: var(--bg-muted)" if changed else "" for changed in s["Changed?"]]
-                    if "Changed?" in s
-                    else "",
+                    lambda row: ["background-color: var(--bg-muted)" if bool(row.get("Changed?", False)) else "" for _ in row],
                     axis=1,
                 )
                 st.dataframe(styled, use_container_width=True, hide_index=True)
@@ -633,23 +695,39 @@ def main():
             st.markdown(f"<div class='caption-box'><strong>Figure caption:</strong> {caption_text}</div>", unsafe_allow_html=True)
             st.markdown("</div>", unsafe_allow_html=True)
 
-        with right_col:
-            st.markdown("<div class='support-card'><div class='section-title'>Supporting Metrics</div>", unsafe_allow_html=True)
-            with st.expander("Electronic descriptors", expanded=True):
-                redox_val = float(bulk_row.get("pred_final", float("nan")))
-                if not np.isfinite(redox_val) or abs(redox_val) < 20:
-                    redox_display = "proxy_only"
-                else:
-                    redox_display = f"{redox_val:.3f}"
-                ed_df = pd.DataFrame(
-                    [
-                        ["Em proxy (uncalibrated)", redox_display, "proxy"],
-                        ["Predicted Em (mV)", float(bulk_row.get("gpr_pred", float("nan"))), "mV"],
-                        ["N5 spin density", n5_spin, "a.u."],
-                        ["HFCC primary", primary_hfcc, "MHz"],
-                        ["HFCC secondary", secondary_hfcc, "MHz"],
-                    ],
-                    columns=["Metric", "Value", "Units"],
+            with right_col:
+                st.markdown("<div class='support-card'><div class='section-title'>Supporting Metrics</div>", unsafe_allow_html=True)
+                with st.expander("Electronic descriptors", expanded=True):
+                    bulk_redox = bulk_row.get("pred_final", float("nan")) if bulk_row is not None else float("nan")
+                    bulk_gpr = bulk_row.get("gpr_pred", float("nan")) if bulk_row is not None else float("nan")
+                    redox_val = _first_finite(q_row.get("pred_final", float("nan")), bulk_redox)
+                    redox_display = f"{redox_val:.3f}" if np.isfinite(redox_val) else "proxy_only"
+                    gpr_pred_val = _first_finite(
+                        q_row.get("gpr_pred", float("nan")),
+                        q_row.get("gpr_pred_raw", float("nan")),
+                        bulk_gpr,
+                    )
+                    fallback_flag_val = _safe_float(q_row.get("gpr_fallback_used", 0))
+                    fallback_used = np.isfinite(fallback_flag_val) and int(fallback_flag_val) != 0
+                    # If GPR collapsed to the training-set mean, fall back to quantum redox.
+                    if np.isfinite(gpr_pred_val) and abs(gpr_pred_val - _TRAIN_MEAN_EM) < 1e-3:
+                        if np.isfinite(redox_val):
+                            gpr_display = f"{redox_val:.3f} (quantum fallback)"
+                        else:
+                            gpr_display = "proxy_only"
+                    elif fallback_used:
+                        gpr_display = f"{gpr_pred_val:.3f} (local fallback)"
+                    else:
+                        gpr_display = f"{gpr_pred_val:.3f}" if np.isfinite(gpr_pred_val) else "proxy_only"
+                    ed_df = pd.DataFrame(
+                        [
+                            ["Em proxy (uncalibrated)", redox_display, "proxy"],
+                            ["Predicted Em (mV)", gpr_display, "mV"],
+                            ["N5 spin density", n5_spin, "a.u."],
+                            ["HFCC primary", primary_hfcc, "MHz"],
+                            ["HFCC secondary", secondary_hfcc, "MHz"],
+                        ],
+                        columns=["Metric", "Value", "Units"],
                 )
                 st.table(ed_df)
                 st.caption("Em proxy is a relative score; Predicted Em (mV) is the calibrated GPR output.")
@@ -701,13 +779,13 @@ def main():
 
             with st.expander("Combinatorial Mutation Recommender", expanded=False):
                 if pdb_file is None and pdb_text is None:
-                    st.info("Upload a PDB to generate recommendations.")
+                    st.info("Upload a PDB/ENT file to generate recommendations.")
                 else:
                     rec_input_path = st.session_state.get("recs_pdb_path", None)
                     if rec_input_path is None:
                         st.warning("PDB not cached for recommendations; re-upload or re-run analysis.")
                     if rec_input_path and not os.path.exists(rec_input_path) and pdb_file is not None:
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdb") as tmp_pdb:
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=upload_suffix) as tmp_pdb:
                             tmp_pdb.write(pdb_file.getvalue())
                             rec_input_path = tmp_pdb.name
                             st.session_state["recs_pdb_path"] = rec_input_path
@@ -723,20 +801,61 @@ def main():
 
                     if st.button("Compute Recommendations", key="compute_recs", disabled=not rec_input_path):
                         exclude_list = [r.strip() for r in do_not_mutate.split(",") if r.strip()]
+                        eta_msg = None
+                        try:
+                            cand_pool = conservative_candidate_pool(
+                                rec_input_path,
+                                exclude_list,
+                                rec_radius,
+                                RECOMMENDER_CONFIG.allow_secondary_shell,
+                            )
+                            single_count = len(cand_pool)
+                            planned_doubles = beam_width if (max_combo_size >= 2 and single_count > 1) else 0
+                            planned_triples = beam_width if (max_combo_size >= 3 and single_count > 2) else 0
+                            planned_evals = 1 + single_count + planned_doubles + planned_triples  # include WT baseline
+                            sec_per_eval_env = os.environ.get("RECOMMENDER_SEC_PER_EVAL", "").strip()
+                            try:
+                                sec_per_eval = float(sec_per_eval_env) if sec_per_eval_env else 8.0
+                                if sec_per_eval <= 0:
+                                    sec_per_eval = 8.0
+                            except ValueError:
+                                sec_per_eval = 8.0
+                            eta_seconds = planned_evals * sec_per_eval
+                            eta_msg = (
+                                f"ETA: ~{_format_eta_seconds(eta_seconds)} "
+                                f"({planned_evals} evaluations, unlimited mode)"
+                            )
+                            st.info(eta_msg)
+                        except Exception:
+                            eta_msg = None
                         try:
                             st.session_state["recs_status"] = "running"
-                            with st.spinner("Computing mutation recommendations..."):
-                                recs = recommend(
-                                    pdb_path=rec_input_path,
-                                    cofactor_choice=cofactor_choice,
-                                    baseline_brightness=float(brightness) if pd.notna(brightness) else 0.0,
-                                    confidence=scs if pd.notna(scs) else 50.0,
-                                    radius=rec_radius,
-                                    max_combo_size=max_combo_size,
-                                    beam_width=beam_width,
-                                    top_n=top_n,
-                                    do_not_mutate=exclude_list,
-                                )
+                            spinner_msg = "Computing mutation recommendations..."
+                            if eta_msg:
+                                spinner_msg = f"Computing mutation recommendations... {eta_msg}"
+                            old_max_single = os.environ.pop("MAX_SINGLE_MUTATIONS", None)
+                            old_budget = os.environ.get("RECOMMENDER_TIME_BUDGET_SEC")
+                            os.environ["RECOMMENDER_TIME_BUDGET_SEC"] = "0"
+                            try:
+                                with st.spinner(spinner_msg):
+                                    recs = recommend(
+                                        pdb_path=rec_input_path,
+                                        cofactor_choice=cofactor_choice,
+                                        baseline_brightness=float(brightness) if pd.notna(brightness) else 0.0,
+                                        confidence=scs if pd.notna(scs) else 50.0,
+                                        radius=rec_radius,
+                                        max_combo_size=max_combo_size,
+                                        beam_width=beam_width,
+                                        top_n=top_n,
+                                        do_not_mutate=exclude_list,
+                                    )
+                            finally:
+                                if old_max_single is not None:
+                                    os.environ["MAX_SINGLE_MUTATIONS"] = old_max_single
+                                if old_budget is None:
+                                    os.environ.pop("RECOMMENDER_TIME_BUDGET_SEC", None)
+                                else:
+                                    os.environ["RECOMMENDER_TIME_BUDGET_SEC"] = old_budget
                             st.session_state["recs_data"] = recs
                             st.session_state["recs_status"] = "ready"
                         except Exception as exc:

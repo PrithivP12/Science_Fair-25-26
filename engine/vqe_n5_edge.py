@@ -7,8 +7,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import hashlib
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 import warnings
@@ -25,7 +27,9 @@ ALLOWED_COFAC = ("FAD", "FMN")
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern, WhiteKernel, ConstantKernel
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, median_absolute_error, r2_score
+from sklearn.preprocessing import StandardScaler
 try:
     from scipy.stats import pearsonr
 except ImportError:  # pragma: no cover
@@ -174,49 +178,265 @@ AA_PROPERTIES = {
     "V": {"e_neg": 0.05, "steric_index": 0.9},
 }
 
+AA3_TO_AA1 = {
+    "ALA": "A",
+    "ARG": "R",
+    "ASN": "N",
+    "ASP": "D",
+    "CYS": "C",
+    "GLN": "Q",
+    "GLU": "E",
+    "GLY": "G",
+    "HIS": "H",
+    "ILE": "I",
+    "LEU": "L",
+    "LYS": "K",
+    "MET": "M",
+    "PHE": "F",
+    "PRO": "P",
+    "SER": "S",
+    "THR": "T",
+    "TRP": "W",
+    "TYR": "Y",
+    "VAL": "V",
+}
+
+FLAVIN_RESN = {"FMN", "FAD", "RIB", "RBF"}
+
+
+def residue_to_aa1(resn: str) -> str:
+    token = (resn or "").strip().upper()
+    if len(token) == 1 and token in AA_PROPERTIES:
+        return token
+    if token in AA3_TO_AA1:
+        return AA3_TO_AA1[token]
+    # Preserve previous fallback behavior for uncommon/unknown residue names.
+    return token[:1] if token else "X"
+
+
+def _cofactor_site_sort_key(key: Tuple[str, str, str, str]) -> Tuple[str, int, str, str, str]:
+    resn, chain, resi, icode = key
+    try:
+        resi_num = int(str(resi).strip())
+    except Exception:
+        resi_num = 10**9
+    return (chain, resi_num, str(resi), icode, resn)
+
+
+def _select_flavin_center(
+    residue_atoms: Dict[Tuple[str, str, str, str], List[Tuple[float, float, float]]],
+    cofactor_sites: Dict[Tuple[str, str, str, str], Dict[str, Any]],
+    radius: float,
+) -> Tuple[np.ndarray | None, Tuple[str, str, str, str] | None]:
+    """
+    Pick one representative cofactor site for multi-chain/multi-cofactor structures.
+    Preference:
+    1) highest count of nearby protein residues within radius
+    2) deterministic chain/resseq order
+    """
+    if not cofactor_sites:
+        return None, None
+
+    best_key = None
+    best_center = None
+    best_score = -1
+    best_sort = None
+    for site_key, site in cofactor_sites.items():
+        center_raw = site.get("n5") if site.get("n5") is not None else site.get("centroid")
+        if center_raw is None:
+            continue
+        center = np.array(center_raw, dtype=float)
+        score = 0
+        for (resn, chain, resi, icode), coords in residue_atoms.items():
+            if resn in FLAVIN_RESN:
+                continue
+            coords_arr = np.array(coords)
+            if coords_arr.size == 0:
+                continue
+            min_dist = float(np.min(np.linalg.norm(coords_arr - center, axis=1)))
+            if min_dist <= radius:
+                score += 1
+        sort_key = _cofactor_site_sort_key(site_key)
+        if (score > best_score) or (score == best_score and (best_sort is None or sort_key < best_sort)):
+            best_score = score
+            best_key = site_key
+            best_center = center
+            best_sort = sort_key
+
+    if best_center is None:
+        # Last-resort deterministic fallback.
+        first_key = sorted(cofactor_sites.keys(), key=_cofactor_site_sort_key)[0]
+        site = cofactor_sites[first_key]
+        center_raw = site.get("n5") if site.get("n5") is not None else site.get("centroid")
+        if center_raw is None:
+            return None, None
+        return np.array(center_raw, dtype=float), first_key
+    return best_center, best_key
+
 
 def compute_lfp_from_pdb(pdb_path: str) -> Tuple[float, float]:
-    """Compute local field potential and steric sum from residues within 5 Å of FMN/FAD centroid."""
+    """Compute local field potential and steric sum around representative flavin site."""
     if not pdb_path or not os.path.exists(pdb_path):
         return 0.0, 0.0
-    fm_coords = []
-    res_coords: Dict[Tuple[str, str, str], list] = {}
+    cofactor_sites: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+    res_coords: Dict[Tuple[str, str, str, str], List[Tuple[float, float, float]]] = {}
     try:
         with open(pdb_path, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
                 if not (line.startswith("ATOM") or line.startswith("HETATM")):
                     continue
-                resn = line[17:20].strip()
-                chain = line[21].strip()
+                resn = line[17:20].strip().upper()
+                chain = (line[21] or "?").strip() or "?"
                 resi = line[22:26].strip()
+                icode = (line[26] or " ").strip() or " "
+                atom = line[12:16].strip().upper()
                 try:
                     x = float(line[30:38])
                     y = float(line[38:46])
                     z = float(line[46:54])
                 except ValueError:
                     continue
-                key = (resn, chain, resi)
+                key = (resn, chain, resi, icode)
                 res_coords.setdefault(key, []).append((x, y, z))
-                if resn in {"FMN", "FAD"}:
-                    fm_coords.append((x, y, z))
+                if resn in FLAVIN_RESN:
+                    site = cofactor_sites.setdefault(key, {"coords": [], "n5": None, "centroid": None})
+                    site["coords"].append((x, y, z))
+                    if atom == "N5":
+                        site["n5"] = (x, y, z)
     except Exception:
         return 0.0, 0.0
-    if not fm_coords:
+    for site in cofactor_sites.values():
+        coords = site.get("coords", [])
+        site["centroid"] = tuple(np.mean(np.array(coords), axis=0)) if coords else None
+
+    fm_center, _ = _select_flavin_center(res_coords, cofactor_sites, radius=5.0)
+    if fm_center is None:
         return 0.0, 0.0
-    fm_centroid = np.mean(np.array(fm_coords), axis=0)
     lfp = 0.0
     steric_sum = 0.0
-    for (resn, chain, resi), coords in res_coords.items():
-        if resn in {"FMN", "FAD"}:
+    for (resn, chain, resi, icode), coords in res_coords.items():
+        if resn in FLAVIN_RESN:
             continue
         coords_arr = np.array(coords)
-        dists = np.linalg.norm(coords_arr - fm_centroid, axis=1)
+        dists = np.linalg.norm(coords_arr - fm_center, axis=1)
         if np.min(dists) <= 5.0:
-            aa = resn[0].upper()
+            aa = residue_to_aa1(resn)
             props = AA_PROPERTIES.get(aa, {"e_neg": 0.0, "steric_index": 0.0})
             lfp += props.get("e_neg", 0.0)
             steric_sum += props.get("steric_index", 0.0)
     return lfp, steric_sum
+
+
+def compute_env_features(pdb_path: str, radius: float = 6.0) -> Tuple[float, float, float, bool]:
+    """
+    Physically motivated environment features around the representative flavin N5/centroid.
+    Returns (iso_est, hbond_cap_est, flexibility_est, flavin_found).
+
+    - iso_est: scaled sum of residue isoelectric points near the flavin ring.
+    - hbond_cap_est: scaled count of H-bond capable residues near the flavin ring.
+    - flexibility_est: softened flexibility proxy from steric indices and local B-factors.
+    """
+    if not pdb_path or not os.path.exists(pdb_path):
+        return 0.0, 0.0, 0.0, False
+
+    # Approximate residue isoelectric points (pI)
+    PI_MAP = {
+        "A": 6.0,
+        "R": 12.5,
+        "N": 5.4,
+        "D": 3.1,
+        "C": 8.3,
+        "Q": 5.7,
+        "E": 2.2,
+        "G": 5.5,
+        "H": 6.0,
+        "I": 6.0,
+        "L": 6.0,
+        "K": 10.5,
+        "M": 5.7,
+        "F": 5.5,
+        "P": 6.3,
+        "S": 5.7,
+        "T": 5.6,
+        "W": 5.9,
+        "Y": 10.1,
+        "V": 6.0,
+    }
+    hb_res = {"S", "T", "N", "Q", "H", "D", "E", "K", "R", "Y"}
+
+    residue_atoms: Dict[Tuple[str, str, str, str], List[Tuple[float, float, float]]] = {}
+    residue_bfactors: Dict[Tuple[str, str, str, str], List[float]] = {}
+    cofactor_sites: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+    try:
+        with open(pdb_path, "r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                if not (line.startswith("ATOM") or line.startswith("HETATM")):
+                    continue
+                resn = line[17:20].strip().upper()
+                chain = (line[21] or "?").strip() or "?"
+                resi = line[22:26].strip()
+                icode = (line[26] or " ").strip() or " "
+                atom = line[12:16].strip().upper()
+                try:
+                    x = float(line[30:38]); y = float(line[38:46]); z = float(line[46:54])
+                    b = float(line[60:66]) if len(line) >= 66 else 20.0
+                except ValueError:
+                    continue
+                coord = (x, y, z)
+                key = (resn, chain, resi, icode)
+                residue_atoms.setdefault(key, []).append(coord)
+                residue_bfactors.setdefault(key, []).append(b)
+                if resn in FLAVIN_RESN:
+                    site = cofactor_sites.setdefault(key, {"coords": [], "n5": None, "centroid": None})
+                    site["coords"].append(coord)
+                    if atom == "N5":
+                        site["n5"] = coord
+    except Exception:
+        return 0.0, 0.0, 0.0, False
+
+    for site in cofactor_sites.values():
+        coords = site.get("coords", [])
+        site["centroid"] = tuple(np.mean(np.array(coords), axis=0)) if coords else None
+
+    flavin_found = len(cofactor_sites) > 0
+    if not flavin_found:
+        return 0.0, 0.0, 0.0, False
+
+    centroid, _ = _select_flavin_center(residue_atoms, cofactor_sites, radius=radius)
+    if centroid is None:
+        return 0.0, 0.0, 0.0, False
+
+    neighbors: List[Tuple[str, float, float]] = []  # (aa, dist, b_mean)
+    for (resn, chain, resi, icode), coords in residue_atoms.items():
+        if resn in FLAVIN_RESN:
+            continue
+        coords_arr = np.array(coords)
+        min_dist = float(np.min(np.linalg.norm(coords_arr - centroid, axis=1)))
+        if min_dist > radius:
+            continue
+        aa = residue_to_aa1(resn)
+        b_mean = float(np.mean(residue_bfactors.get((resn, chain, resi, icode), [20.0])))
+        neighbors.append((aa, min_dist, b_mean))
+
+    if not neighbors:
+        return 0.0, 0.0, 0.0, True
+
+    # Isoelectric point proxy
+    pi_sum = sum(PI_MAP.get(aa, 6.5) for aa, _, _ in neighbors)
+    iso_est = pi_sum / max(1.5, len(neighbors) / 2.5)
+
+    # H-bonding capacity proxy
+    hb_count = sum(1 for aa, _, _ in neighbors if aa in hb_res)
+    hb_cap = min(5.0, hb_count / 2.0)
+
+    # Flexibility proxy using steric index + B-factors
+    steric_vals = [AA_PROPERTIES.get(aa, {"steric_index": 0.7}).get("steric_index", 0.7) for aa, _, _ in neighbors]
+    steric_mean = float(np.mean(steric_vals)) if steric_vals else 0.7
+    b_mean_global = float(np.mean([b for _, _, b in neighbors]))
+    flex_est = 0.6 + 0.4 * steric_mean + 0.006 * min(b_mean_global, 60.0)
+    flex_est = float(np.clip(flex_est, 1.05, 1.60))
+
+    return iso_est, hb_cap, flex_est, True
 
 
 def neighbor_electronic_influence(resn: str, distance: float) -> Tuple[float, float]:
@@ -232,6 +452,69 @@ def neighbor_electronic_influence(resn: str, distance: float) -> Tuple[float, fl
     shift = charge * proximity * 0.1  # soften magnitude
     spin_boost = spin * proximity * 0.2
     return shift, spin_boost
+
+
+def locate_pdb_file(pdb_id: str, structure_path: str | None = None) -> str | None:
+    """
+    Resolve a PDB path for a given identifier using common search locations.
+    Preference order:
+      1) explicit structure_path column (if exists)
+      2) data/pdb/{PDB_ID}.pdb
+      3) pdbs/{PDB_ID}.pdb
+    """
+    pdb_id = (pdb_id or "").strip()
+    if not pdb_id:
+        return None
+    candidates = []
+    if structure_path:
+        candidates.append(Path(structure_path))
+    base_dir = Path(__file__).resolve().parent.parent
+    candidates.extend(
+        [
+            base_dir / "data" / "pdb" / f"{pdb_id.upper()}.pdb",
+            base_dir / "pdbs" / f"{pdb_id.upper()}.pdb",
+        ]
+    )
+    for cand in candidates:
+        try:
+            if cand.exists():
+                return str(cand)
+        except Exception:
+            continue
+    return None
+
+
+UNIPROT_ACCESSION_RE = re.compile(
+    r"^(?:[OPQ][0-9][A-Z0-9]{3}[0-9]|[A-NR-Z][0-9](?:[A-Z][A-Z0-9]{2}[0-9]){1,2})$"
+)
+
+
+def extract_uniprot_from_pdb(pdb_path: str) -> str | None:
+    """
+    Best-effort UniProt accession extraction from PDB DBREF/SEQADV records.
+    """
+    if not pdb_path or not os.path.exists(pdb_path):
+        return None
+    try:
+        with open(pdb_path, "r", encoding="utf-8", errors="ignore") as handle:
+            for line in handle:
+                if not line.startswith(("DBREF", "DBREF1", "DBREF2", "SEQADV")):
+                    continue
+                if "UNP" not in line.upper() and "UNIPROT" not in line.upper():
+                    continue
+                parts = line.split()
+                for i, tok in enumerate(parts):
+                    if tok.upper() in {"UNP", "UNIPROT"} and i + 1 < len(parts):
+                        cand = parts[i + 1].strip().upper()
+                        if UNIPROT_ACCESSION_RE.match(cand):
+                            return cand
+                for tok in parts:
+                    cand = tok.strip().upper()
+                    if UNIPROT_ACCESSION_RE.match(cand):
+                        return cand
+    except Exception:
+        return None
+    return None
 
 
 def detect_cofactor_from_pdb(pdb_path: str):
@@ -1058,17 +1341,55 @@ def predict_energy_16q(
     return energy_mv + orientation_shift, profile
 
 
+GPR_FEATURE_COLUMNS = ["Around_N5_IsoelectricPoint", "Around_N5_HBondCap", "Around_N5_Flexibility"]
+
+
+def gpr_feature_matrix(df: pd.DataFrame) -> np.ndarray:
+    return df[GPR_FEATURE_COLUMNS].values.astype(float)
+
+
 def train_gpr(df: pd.DataFrame) -> GaussianProcessRegressor:
-    X = df[["Around_N5_IsoelectricPoint", "Around_N5_HBondCap", "Around_N5_Flexibility"]].values
-    y = df["Em"].values
-    # dynamic length scale based on local variance to increase sensitivity
-    ls = max(0.1, float(np.std(X) if X.size else 0.5))
-    kernel = ConstantKernel(1.0, (1e-2, 1e2)) * Matern(length_scale=ls, nu=1.5) + WhiteKernel(
-        noise_level=1.0, noise_level_bounds=(1e-5, 1e2)
-    )
-    gpr = GaussianProcessRegressor(kernel=kernel, normalize_y=True, n_restarts_optimizer=2, random_state=42)
-    gpr.fit(X, y)
+    """
+    Train a scaled GPR model.
+    Scaling + ARD prevents the optimizer from collapsing to tiny isotropic
+    length scales that force mean-only predictions on unseen proteins.
+    """
+    X = gpr_feature_matrix(df)
+    y = df["Em"].values.astype(float)
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    kernel = ConstantKernel(1.0, (1e-2, 1e2)) * Matern(
+        length_scale=np.ones(X.shape[1], dtype=float),
+        length_scale_bounds=(0.25, 10.0),
+        nu=1.5,
+    ) + WhiteKernel(noise_level=1.0, noise_level_bounds=(1e-4, 1e2))
+    gpr = GaussianProcessRegressor(kernel=kernel, normalize_y=True, n_restarts_optimizer=8, random_state=42)
+    gpr.fit(X_scaled, y)
+    # Attach scaler for predictable single-call inference.
+    setattr(gpr, "_feature_scaler", scaler)
     return gpr
+
+
+def predict_gpr(gpr: GaussianProcessRegressor, X: np.ndarray, return_std: bool = False):
+    scaler = getattr(gpr, "_feature_scaler", None)
+    X_use = scaler.transform(X) if scaler is not None else X
+    return gpr.predict(X_use, return_std=return_std)
+
+
+def train_local_regressor(df: pd.DataFrame) -> RandomForestRegressor:
+    """
+    Local fallback model used only when single-upload GPR collapses to dataset mean.
+    """
+    X = gpr_feature_matrix(df)
+    y = df["Em"].values.astype(float)
+    reg = RandomForestRegressor(
+        n_estimators=300,
+        min_samples_leaf=2,
+        random_state=42,
+        n_jobs=-1,
+    )
+    reg.fit(X, y)
+    return reg
 
 
 def cluster_labels(df: pd.DataFrame) -> Tuple[np.ndarray, Dict[int, str]]:
@@ -1087,8 +1408,27 @@ def cluster_labels(df: pd.DataFrame) -> Tuple[np.ndarray, Dict[int, str]]:
     return fam_labels, cluster_map
 
 
+def _read_tabular(path: Path) -> pd.DataFrame:
+    """Read CSV or Excel, normalizing column names."""
+    if not path.exists():
+        return pd.DataFrame()
+    suffix = path.suffix.lower()
+    if suffix in {".xls", ".xlsx"}:
+        df = pd.read_excel(path, engine="openpyxl")
+    else:
+        df = safe_read_csv(path, low_memory=False)
+    # normalize column names: strip, replace non-alnum with underscore
+    import re
+    new_cols = []
+    for c in df.columns:
+        norm = re.sub(r"[^A-Za-z0-9]+", "_", str(c)).strip("_")
+        new_cols.append(norm)
+    df.columns = new_cols
+    return df
+
+
 def load_dataset(path: str) -> Tuple[pd.DataFrame, str]:
-    """Load the dataset, falling back to the bundled CSV if the requested file is missing."""
+    """Load dataset (CSV or Excel), prefer user path, else bundled CSV."""
     base_dir = Path(__file__).resolve().parent.parent
     candidates = []
     if path:
@@ -1099,22 +1439,69 @@ def load_dataset(path: str) -> Tuple[pd.DataFrame, str]:
 
     tried = []
     required_cols = ["Em", "Around_N5_IsoelectricPoint", "Around_N5_HBondCap", "Around_N5_Flexibility"]
+
     for candidate in candidates:
         tried.append(str(candidate))
-        if candidate and candidate.exists():
-            df = safe_read_csv(candidate, low_memory=False)
-            df.columns = [c.strip() for c in df.columns]
-            if len(df) == 0:
-                continue
-            if any(col not in df.columns for col in required_cols):
-                continue
-            return df, str(candidate)
+        if not candidate.exists():
+            continue
+        df_raw = _read_tabular(candidate)
+        if df_raw.empty:
+            continue
+        # attempt column remapping
+        col_map = {}
+        lower_cols = {c.lower(): c for c in df_raw.columns}
+        # direct matches
+        for req in required_cols + ["pdb_id", "uniprot_id", "cofactor"]:
+            if req in df_raw.columns:
+                col_map[req] = req
+        # heuristic matches
+        if "pdb id" in lower_cols:
+            col_map["pdb_id"] = lower_cols["pdb id"]
+        if "around_n5_isoelectric_point" in lower_cols:
+            col_map["Around_N5_IsoelectricPoint"] = lower_cols["around_n5_isoelectric_point"]
+        if "around_n5_ flexibility".lower() in lower_cols:
+            col_map["Around_N5_Flexibility"] = lower_cols["around_n5_ flexibility".lower()]
+        if "around_n5_flexibility" in lower_cols:
+            col_map["Around_N5_Flexibility"] = lower_cols["around_n5_flexibility"]
+        # hbond: map from nH-bonds if present
+        for key in ("around_n5_nh_bonds", "around_n5_hbondcap", "around_n5_nh_bonds_", "around_n5_nh_bonds"):
+            if key in lower_cols:
+                col_map["Around_N5_HBondCap"] = lower_cols[key]
+                break
+        if "em" in lower_cols:
+            col_map["Em"] = lower_cols["em"]
+
+        df = pd.DataFrame()
+        for req in required_cols:
+            src = col_map.get(req)
+            if src and src in df_raw.columns:
+                df[req] = df_raw[src]
+        if df.empty or any(req not in df.columns for req in required_cols):
+            continue
+
+        # optional identifiers (fill with defaults if missing)
+        def _col_or_default(key, default):
+            src = col_map.get(key, "")
+            series = df_raw[src] if src in df_raw.columns else None
+            if series is None:
+                return pd.Series([default] * len(df_raw))
+            return series.fillna(default)
+
+        df["pdb_id"] = _col_or_default("pdb_id", "DATASET").astype(str)
+        df["uniprot_id"] = _col_or_default("uniprot_id", "UNK").astype(str)
+        df["cofactor"] = _col_or_default("cofactor", "FMN").astype(str)
+        if "N5_nearest_resname" not in df_raw.columns:
+            df["N5_nearest_resname"] = "UNK"
+        else:
+            df["N5_nearest_resname"] = df_raw["N5_nearest_resname"].fillna("UNK").astype(str)
+        return df, str(candidate)
 
     tried_str = ", ".join(tried)
-    raise FileNotFoundError(f"Dataset not found. Tried: {tried_str}. Pass --data with a valid CSV path.")
+    raise FileNotFoundError(f"Dataset not found. Tried: {tried_str}. Pass --data with a valid CSV/Excel path.")
 
 
 def main(args: argparse.Namespace) -> None:
+    import numpy as np  # ensure available even if shadowed in inner scopes
     global electro_factor_mut, vib_factor_mut, perturb_a426c
     # purge any stale geometry cache
     cache_file = Path("internal_geometry_cache")
@@ -1127,6 +1514,42 @@ def main(args: argparse.Namespace) -> None:
     df, data_path_used = load_dataset(args.data)
     if data_path_used != args.data:
         print(f"INFO: dataset not found at {args.data}; using {data_path_used}")
+
+    # Training statistics from the curated dataset (do not overwrite dataset columns).
+    train_stats = {
+        "iso_mean": float(df["Around_N5_IsoelectricPoint"].mean()),
+        "iso_std": float(df["Around_N5_IsoelectricPoint"].std(ddof=0)),
+        "hb_mean": float(df["Around_N5_HBondCap"].mean()),
+        "hb_std": float(df["Around_N5_HBondCap"].std(ddof=0)),
+        "flex_mean": float(df["Around_N5_Flexibility"].mean()),
+        "flex_std": float(df["Around_N5_Flexibility"].std(ddof=0)),
+    }
+
+    # Geometry-derived baseline stats (used only for rescaling single-upload features).
+    geom_samples = []
+    structure_path_col = "structure_path" in df.columns
+    for _, row in df.iterrows():
+        pdb_id = str(row.get("pdb_id", "")).upper()
+        pdb_path = locate_pdb_file(pdb_id, row.get("structure_path", "") if structure_path_col else None)
+        if not pdb_path:
+            continue
+        iso_val, hb_val, flex_val, flavin_found = compute_env_features(pdb_path)
+        if flavin_found:
+            geom_samples.append((iso_val, hb_val, flex_val))
+    if geom_samples:
+        import numpy as np
+
+        geom_arr = np.array(geom_samples)
+        geom_stats = {
+            "iso_mean": float(geom_arr[:, 0].mean()),
+            "iso_std": float(geom_arr[:, 0].std(ddof=0)),
+            "hb_mean": float(geom_arr[:, 1].mean()),
+            "hb_std": float(geom_arr[:, 1].std(ddof=0)),
+            "flex_mean": float(geom_arr[:, 2].mean()),
+            "flex_std": float(geom_arr[:, 2].std(ddof=0)),
+        }
+    else:
+        geom_stats = None
     df = df[[c for c in FEATURES if c in df.columns]].copy()
     required_cols = ["Em", "Around_N5_IsoelectricPoint", "Around_N5_HBondCap", "Around_N5_Flexibility"]
     missing_cols = [c for c in required_cols if c not in df.columns]
@@ -1180,12 +1603,22 @@ def main(args: argparse.Namespace) -> None:
 
     cofactor_selected = os.environ.get("COFACTOR_SELECTED", "").strip().upper()
     if cofactor_selected not in ALLOWED_COFAC:
-        raise SystemExit("Cofactor selection required: choose FAD or FMN.")
+        detected = detect_cofactor_from_pdb(args.pdb) if single_mode and args.pdb else None
+        if detected and detected.get("type", "").upper() in ALLOWED_COFAC:
+            cofactor_selected = detected["type"].upper()
+            print(f"INFO: COFACTOR_SELECTED not provided; auto-detected {cofactor_selected}.")
+    if cofactor_selected not in ALLOWED_COFAC:
+        raise SystemExit("Cofactor selection required: set COFACTOR_SELECTED=FAD or FMN, or include the cofactor in the PDB.")
     force_cofactor = os.environ.get("COFACTOR_FORCE", "0").strip() in {"1", "true", "True"}
     user_cofactor_choice = cofactor_selected
 
     mutation_list_env = os.environ.get("MUTATION_LIST", "")
     uniprot_id_env = os.environ.get("UNIPROT_ID", "").strip().upper()
+    if not uniprot_id_env and single_mode and args.pdb:
+        detected_uniprot = extract_uniprot_from_pdb(args.pdb)
+        if detected_uniprot:
+            uniprot_id_env = detected_uniprot
+            print(f"INFO: UNIPROT_ID not provided; auto-detected {uniprot_id_env}.")
     cry_ids = {"P26484", "Q9VBW3"}
     force_uhf = bool(uniprot_id_env and (uniprot_id_env in cry_ids or uniprot_id_env.startswith("CRY")))
     parsed_mutations, parse_errors = parse_mutation_list(mutation_list_env)
@@ -1317,47 +1750,119 @@ def main(args: argparse.Namespace) -> None:
     structural_info["flavin_type"] = cofactor_mode
     structural_info["computational_mode"] = f"{cofactor_mode}-Quantum-State"
 
+    # Ensure essential identifiers exist even for minimal datasets
+    if "pdb_id" not in df.columns:
+        df["pdb_id"] = "DATASET"
+    if "uniprot_id" not in df.columns:
+        df["uniprot_id"] = "UNK"
+
+    train_df = df.copy()
+    infer_df = df.copy()
     if single_mode:
-        mean_row = df.mean(numeric_only=True)
-        pdb_id_single = Path(args.pdb).stem.upper() if args.pdb else "FAD_BASELINE"
+        mean_row = train_df.mean(numeric_only=True)
+        pdb_label_env = os.environ.get("PDB_LABEL", "").strip()
+        pdb_id_single = pdb_label_env.upper() if pdb_label_env else (Path(args.pdb).stem.upper() if args.pdb else "FAD_BASELINE")
         print(f"STATUS: Scanning residue {pdb_id_single}...")
-        around_iso = float(mean_row.get("Around_N5_IsoelectricPoint", df["Around_N5_IsoelectricPoint"].mean()))
-        around_hb = float(mean_row.get("Around_N5_HBondCap", df["Around_N5_HBondCap"].mean()))
-        around_flex = float(mean_row.get("Around_N5_Flexibility", df["Around_N5_Flexibility"].mean()))
-        around_iso += lfp_pdb + mutation_lfp_sum
-        around_hb += 0.5 * (steric_pdb + mutation_steric_sum)
-        around_flex *= (1.0 + 0.02 * len(mutations))
-        single_entry = {
-            "pdb_id": pdb_id_single,
-            "uniprot_id": "NA",
-            "Em": float(mean_row.get("Em", df["Em"].mean())),
-            "Around_N5_IsoelectricPoint": around_iso,
-            "Around_N5_HBondCap": around_hb,
-            "Around_N5_Flexibility": around_flex,
-            "N5_nearest_resname": "UNK",
-            "cofactor": "NA",
-        }
-        df = pd.DataFrame([single_entry])
+        env_iso, env_hb, env_flex, flavin_found = compute_env_features(args.pdb)
+        # rescale geometry-derived features to the training distribution to avoid domain drift
+        def _align(val, key):
+            if not geom_stats:
+                return val
+            g_mean = geom_stats.get(f"{key}_mean", 0.0)
+            g_std = geom_stats.get(f"{key}_std", 1.0) or 1.0
+            t_mean = train_stats.get(f"{key}_mean", g_mean)
+            t_std = train_stats.get(f"{key}_std", g_std) or g_std
+            scale = t_std / g_std if g_std > 1e-6 else 1.0
+            return (val - g_mean) * scale + t_mean
 
-    # GPR retained for diagnostics, but redox will use quantum-only pathway
-    gpr = train_gpr(df)
-    X_gpr = df[["Around_N5_IsoelectricPoint", "Around_N5_HBondCap", "Around_N5_Flexibility"]].values
-    gpr_pred, gpr_sigma = gpr.predict(X_gpr, return_std=True)
-    df["gpr_pred_raw"] = gpr_pred
-    df["gpr_sigma"] = gpr_sigma
+        env_iso = _align(env_iso, "iso")
+        env_hb = _align(env_hb, "hb")
+        env_flex = _align(env_flex, "flex")
+        if not flavin_found:
+            print("ERROR: No FMN/FAD atoms detected in provided PDB; cannot build features.", file=sys.stderr)
+            raise SystemExit(1)
+        if env_iso == env_hb == env_flex == 0.0:
+            env_iso = float(mean_row.get("Around_N5_IsoelectricPoint", train_df["Around_N5_IsoelectricPoint"].mean()))
+            env_hb = float(mean_row.get("Around_N5_HBondCap", train_df["Around_N5_HBondCap"].mean()))
+            env_flex = float(mean_row.get("Around_N5_Flexibility", train_df["Around_N5_Flexibility"].mean()))
+        env_iso += lfp_pdb + mutation_lfp_sum
+        env_hb += 0.5 * (steric_pdb + mutation_steric_sum)
+        env_flex *= (1.0 + 0.02 * len(mutations))
+        infer_df = pd.DataFrame(
+            [
+                {
+                    "pdb_id": pdb_id_single,
+                    "uniprot_id": uniprot_id_env or "NA",
+                    "Em": float("nan"),
+                    "Around_N5_IsoelectricPoint": env_iso,
+                    "Around_N5_HBondCap": env_hb,
+                    "Around_N5_Flexibility": env_flex,
+                    "N5_nearest_resname": "UNK",
+                    "cofactor": user_cofactor_choice,
+                }
+            ]
+        )
 
-    iso_mean, iso_std = df["Around_N5_IsoelectricPoint"].mean(), df["Around_N5_IsoelectricPoint"].std(ddof=0)
-    hb_mean, hb_std = df["Around_N5_HBondCap"].mean(), df["Around_N5_HBondCap"].std(ddof=0)
+    gpr = train_gpr(train_df)
+    local_reg = train_local_regressor(train_df)
+    train_X = gpr_feature_matrix(train_df)
+    train_pred, train_sigma = predict_gpr(gpr, train_X, return_std=True)
+    train_df["gpr_pred_raw"] = train_pred
+    train_df["gpr_sigma"] = train_sigma
 
-    fam_labels, cluster_map = cluster_labels(df)
-    df["family"] = fam_labels
-    gpr_mean = df["gpr_pred_raw"].mean()
-    gpr_std = df["gpr_pred_raw"].std(ddof=0)
-    sigma_median = float(np.median(df["gpr_sigma"]))
-    dataset_mean_em = df["Em"].mean()
+    X_gpr = gpr_feature_matrix(infer_df)
+    gpr_pred_base, gpr_sigma = predict_gpr(gpr, X_gpr, return_std=True)
+    local_pred = local_reg.predict(X_gpr)
+    dataset_mean_em = float(train_df["Em"].mean())
+    sigma_hi = float(np.quantile(train_sigma, 0.75)) if len(train_sigma) else float("inf")
+    collapse_eps = max(1e-3, 0.01 * max(1.0, abs(dataset_mean_em)))
+    collapse_mask = np.abs(gpr_pred_base - dataset_mean_em) <= collapse_eps
+    fallback_mask = collapse_mask | (gpr_sigma >= sigma_hi)
+    # In single-upload mode, blend in a local non-parametric estimate when GPR
+    # collapses to mean/high-uncertainty behavior.
+    if single_mode:
+        gpr_pred = np.where(fallback_mask, 0.35 * gpr_pred_base + 0.65 * local_pred, gpr_pred_base)
+    else:
+        gpr_pred = gpr_pred_base
 
-    # Success group profile based on GPR-only performance (<36 mV)
-    success_gpr = df.assign(abs_err_gpr_only=(df["Em"] - df["gpr_pred_raw"]).abs())
+    prior_em = float("nan")
+    prior_used = np.zeros(len(infer_df), dtype=int)
+    if single_mode and uniprot_id_env and "uniprot_id" in train_df.columns:
+        train_uid = train_df["uniprot_id"].astype(str).str.upper()
+        prior_df = train_df[train_uid == uniprot_id_env]
+        if "cofactor" in prior_df.columns:
+            cofactor_mask = prior_df["cofactor"].astype(str).str.upper() == user_cofactor_choice.upper()
+            if cofactor_mask.any():
+                prior_df = prior_df[cofactor_mask]
+        if not prior_df.empty:
+            prior_em = float(prior_df["Em"].mean())
+            # Higher GPR uncertainty -> rely more on same-UniProt empirical anchor.
+            blend = np.clip((np.array(gpr_sigma) - 55.0) / 70.0, 0.35, 0.85)
+            gpr_pred = blend * prior_em + (1.0 - blend) * np.array(gpr_pred)
+            prior_used[:] = 1
+            print(
+                f"INFO: Applied UniProt prior for {uniprot_id_env}: mean Em={prior_em:.3f} mV (n={len(prior_df)})."
+            )
+
+    infer_df["gpr_pred_raw"] = gpr_pred
+    infer_df["gpr_sigma"] = gpr_sigma
+    infer_df["gpr_local_pred"] = local_pred
+    infer_df["gpr_fallback_used"] = fallback_mask.astype(int)
+    infer_df["gpr_prior_em"] = prior_em
+    infer_df["gpr_prior_used"] = prior_used.astype(int)
+
+    iso_mean, iso_std = train_df["Around_N5_IsoelectricPoint"].mean(), train_df["Around_N5_IsoelectricPoint"].std(ddof=0)
+    hb_mean, hb_std = train_df["Around_N5_HBondCap"].mean(), train_df["Around_N5_HBondCap"].std(ddof=0)
+
+    fam_labels, cluster_map = cluster_labels(train_df)
+    train_df["family"] = fam_labels
+    infer_fam_labels, _ = cluster_labels(infer_df)
+    infer_df["family"] = infer_fam_labels
+    gpr_mean = train_df["gpr_pred_raw"].mean()
+    gpr_std = train_df["gpr_pred_raw"].std(ddof=0)
+    sigma_median = float(np.median(train_df["gpr_sigma"]))
+
+    success_gpr = train_df.assign(abs_err_gpr_only=(train_df["Em"] - train_df["gpr_pred_raw"]).abs())
     success_gpr = success_gpr[success_gpr["abs_err_gpr_only"] < TARGET_BENCHMARK]
     success_means = {
         "flex": float(success_gpr["Around_N5_Flexibility"].mean()) if not success_gpr.empty else 0.0,
@@ -1372,11 +1877,11 @@ def main(args: argparse.Namespace) -> None:
     success_mean_em = float(success_gpr["Em"].mean()) if not success_gpr.empty else gpr_mean
 
     # Identify top-54 misses by GPR error magnitude
-    df["abs_err_gpr_only"] = (df["Em"] - df["gpr_pred_raw"]).abs()
-    miss_ids = set(df.sort_values("abs_err_gpr_only", ascending=False).head(54)["pdb_id"].astype(str).str.upper())
+    train_df["abs_err_gpr_only"] = (train_df["Em"] - train_df["gpr_pred_raw"]).abs()
+    miss_ids = set(train_df.sort_values("abs_err_gpr_only", ascending=False).head(54)["pdb_id"].astype(str).str.upper())
 
     records = []
-    for idx, row in df.iterrows():
+    for idx, row in infer_df.iterrows():
         iso_val = float(row["Around_N5_IsoelectricPoint"])
         flex_val = float(row["Around_N5_Flexibility"])
         hb_val = float(row["Around_N5_HBondCap"])
@@ -1579,7 +2084,7 @@ def main(args: argparse.Namespace) -> None:
         # derive redox strictly from quantum energies (E_anion - E_neutral) and st_gap
         st_gap_val = profile_used.get("st_gap", float("nan"))
         st_gap_local = float(profile_used.get("st_gap", st_gap_val) if profile_used else st_gap_val)
-        if pd.notna(st_gap_local) and st_gap_local > 0:
+        if (not single_mode) and pd.notna(st_gap_local) and st_gap_local > 0:
             faraday_const = 96.485  # kJ/mol per V; using proxy to move away from hardcoded mV
             energy_delta = pred_q_used - pred_gpr  # proxy for (E_radical - E_neutral)
             hybrid_pred_em = (energy_delta) / max(faraday_const, 1e-6)
@@ -1593,10 +2098,20 @@ def main(args: argparse.Namespace) -> None:
                 coupling_label = "COMPASS ACTIVE"
         if st_gap_local > 0.4:
             coupling_label = "MAGNETICALLY INERT"
-        if not np.isfinite(pred_final) or abs(pred_final + 207.887) < 1e-3:
-            pred_final = float("nan")
+        # If quantum prediction fails, fall back to quantum energy or GPR (no hardcoded constants)
         if not np.isfinite(pred_final):
-            pred_final = float("nan")
+            if np.isfinite(pred_q_used):
+                pred_final = float(pred_q_used)
+            elif np.isfinite(pred_gpr):
+                pred_final = float(pred_gpr)
+        if single_mode:
+            prior_used_local = bool(int(row.get("gpr_prior_used", 0)))
+            q_corr_cap = 10.0 if prior_used_local else 20.0
+            q_corr = 0.0
+            if np.isfinite(pred_q_used) and np.isfinite(pred_gpr):
+                q_corr = float(np.clip(0.08 * (pred_q_used - pred_gpr), -q_corr_cap, q_corr_cap))
+            pred_final = float(pred_gpr + q_corr if np.isfinite(pred_gpr) else pred_final)
+            used_model = f"{used_model}|single_calibrated"
         # append st_gap and brightness into feature hash for collision resistance
         feature_vector["st_gap_local"] = st_gap_local if pd.notna(st_gap_local) else 0.0
         feature_vector["pred_final"] = pred_final
@@ -1649,17 +2164,20 @@ def main(args: argparse.Namespace) -> None:
         )
         if profile_used.get("magnetic_activity", "") == "MAGNETICALLY INACTIVE":
             coupling_label = "MAGNETICALLY INACTIVE"
-
-    records.append(
-        {
-            "index": int(idx),
-            "pdb_id": row.get("pdb_id"),
-            "uniprot_id": row.get("uniprot_id"),
+        records.append(
+            {
+                "index": int(idx),
+                "pdb_id": row.get("pdb_id"),
+                "uniprot_id": row.get("uniprot_id"),
                 "family": fam,
                 "true_Em": float(row["Em"]),
                 "gpr_pred": float(pred_gpr),
                 "gpr_pred_raw": float(pred_gpr_raw),
                 "gpr_sigma": float(row["gpr_sigma"]),
+                "gpr_local_pred": float(row.get("gpr_local_pred", float("nan"))),
+                "gpr_fallback_used": int(row.get("gpr_fallback_used", 0)),
+                "gpr_prior_em": float(row.get("gpr_prior_em", float("nan"))),
+                "gpr_prior_used": int(row.get("gpr_prior_used", 0)),
                 "pred_4q": float(pred_4q_raw),
                 "pred_q_used": float(pred_q_used),
                 "pred_final": float(pred_final),
@@ -1671,8 +2189,9 @@ def main(args: argparse.Namespace) -> None:
                 "abs_err_final": abs(row["Em"] - pred_final),
                 "complexity_score": complexity,
                 "used_model": used_model,
-                "Around_N5_Flexibility": flex_val,
-                "Around_N5_HBondCap": hb_val,
+                "Around_N5_IsoelectricPoint": float(row.get("Around_N5_IsoelectricPoint", 0.0)),
+                "Around_N5_HBondCap": float(hb_val),
+                "Around_N5_Flexibility": float(flex_val),
                 "ESP_Moment1": esp_m1,
                 "ESP_Moment2": esp_m2,
                 "ESP_Moment3": esp_m3,
@@ -1705,25 +2224,35 @@ def main(args: argparse.Namespace) -> None:
                 "cofactor_validation": structural_info.get("cofactor_validation", "FAIL" if not cofactor_present else "PASS"),
                 "geometry_check_passed": geometry_check_passed,
                 "st_crossing_detected": bool(st_crossing_flag),
-            "mutation_key": mutation_key,
-            "mutation_list": mutation_str,
-            "mutation_display": mutation_display,
-            "mutation_list_raw": mutation_list_env,
-            "num_mutations": len(mutations),
-            "mutations_validated": True,
-            "mutations_applied": bool(mutations),
-            "coupling_label": coupling_label,
-            "run_key": run_key(structure_hash, user_cofactor_choice, mutations, metadata=f"{pdb_header}|{mutation_key}|st{st_gap_local:.6f}"),
-            "closest_neighbor_resn": neighbor_resn or "",
-            "closest_neighbor_distance": float(neighbor_distance),
-            "nearest_atom_report": nearest_atom_report,
-            "feature_hash": fhash,
-        }
+                "mutation_key": mutation_key,
+                "mutation_list": mutation_str,
+                "mutation_display": mutation_display,
+                "mutation_list_raw": mutation_list_env,
+                "num_mutations": len(mutations),
+                "mutations_validated": True,
+                "mutations_applied": bool(mutations),
+                "coupling_label": coupling_label,
+                "run_key": run_key(structure_hash, user_cofactor_choice, mutations, metadata=f"{pdb_header}|{mutation_key}|st{st_gap_local:.6f}"),
+                "closest_neighbor_resn": neighbor_resn or "",
+                "closest_neighbor_distance": float(neighbor_distance),
+                "nearest_atom_report": nearest_atom_report,
+                "feature_hash": fhash,
+                "structure_hash": structure_hash,
+                "quantum_delta_used": float(quantum_delta),
+                "esp_moment1": esp_m1,
+                "esp_moment2": esp_m2,
+                "esp_moment3": esp_m3,
+                "lov_domain": lov_domain_active,
+                "pdb_id_upper": str(row.get("pdb_id", "")).upper(),
+                "pdb_header": pdb_header,
+            }
     )
-
     res_df = pd.DataFrame(records)
-    out_dir = Path(os.getcwd()) / "artifacts" / "qc_n5_gpr"
-    os.makedirs(out_dir, exist_ok=True)
+    print(f"INFO: processed {len(res_df)} entries in this run.")
+    if res_df.empty:
+        raise SystemExit("Training dataset invalid")
+    out_dir = Path("artifacts") / "qc_n5_gpr"
+    out_dir.mkdir(parents=True, exist_ok=True)
     bulk_path = out_dir / "bulk_quantum_results.csv"
     profile_path = out_dir / "Final_Quantum_Profiles.csv"
     q_profile = res_df[
@@ -1731,6 +2260,12 @@ def main(args: argparse.Namespace) -> None:
             "pdb_id",
             "true_Em",
             "gpr_pred",
+            "gpr_pred_raw",
+            "gpr_sigma",
+            "gpr_local_pred",
+            "gpr_fallback_used",
+            "gpr_prior_em",
+            "gpr_prior_used",
             "pred_final",
             "scs",
             "triad_score",
@@ -1755,6 +2290,7 @@ def main(args: argparse.Namespace) -> None:
             "num_mutations",
             "mutations_validated",
             "mutations_applied",
+            "Around_N5_IsoelectricPoint",
             "Around_N5_Flexibility",
             "Around_N5_HBondCap",
             "computational_mode",
@@ -1816,7 +2352,7 @@ def main(args: argparse.Namespace) -> None:
             q_profile = pd.concat([existing_prof, q_profile], ignore_index=True)
         atomic_write_csv(q_profile, profile_path, append=False, expected_columns=q_profile.columns.tolist())
         # also write unique per-run file
-        per_run_path = profile_path.with_name(f"{res_df.iloc[0]['pdb_id']}.csv")
+        per_run_path = profile_path.with_name(f"{res_df.iloc[-1]['pdb_id']}.csv")
         atomic_write_csv(q_profile.tail(1), per_run_path, append=False, expected_columns=q_profile.columns.tolist())
         flavin_label = structural_info.get("flavin_type") or "Flavin"
         print(f"STATUS: {flavin_label} Found at synthetic coordinates (single upload mode)")
@@ -1830,7 +2366,7 @@ def main(args: argparse.Namespace) -> None:
             os.chmod(bulk_path, 0o777)
         except Exception:
             pass
-        print(f"SUCCESS: Saved {res_df.iloc[0]['pdb_id']} to {profile_path.resolve()}")
+        print(f"SUCCESS: Saved {res_df.iloc[-1]['pdb_id']} to {profile_path.resolve()}")
         print("VQE_COMPLETE")
         return
     else:
@@ -1838,7 +2374,7 @@ def main(args: argparse.Namespace) -> None:
         try:
             atomic_write_csv(q_profile, profile_path, append=False, expected_columns=q_profile.columns.tolist())
             # unique per-run profile file
-            per_run_path = profile_path.with_name(f"{res_df.iloc[0]['pdb_id']}.csv")
+            per_run_path = profile_path.with_name(f"{res_df.iloc[-1]['pdb_id']}.csv")
             atomic_write_csv(q_profile.tail(1), per_run_path, append=False, expected_columns=q_profile.columns.tolist())
             os.chmod(profile_path, 0o777)
         except Exception:
