@@ -1,5 +1,0 @@
-Our Global MAE: 46.25 mV
-JCIM 2022 MAE: 36 mV
-Chemical Accuracy (<43 mV) hits: 85
-Sub-36 mV hits: 74
-Mean error reduction (GPR - Hybrid): -0.96 mV
